@@ -2,12 +2,13 @@ import { useAtomValue } from "@effect/atom-react";
 import { ChartNoAxesColumnIcon } from "lucide-react";
 import { memo, useMemo } from "react";
 
-import { primaryServerProvidersAtom } from "../../state/server";
+import { useEnvironments } from "../../state/environments";
+import { environmentServerConfigsAtom } from "../../state/server";
 import { cn } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import {
-  getCodexLimitsViews,
+  getCodexLimitsViewsForEnvironments,
   type CodexLimitWindowView,
   type CodexLimitsView,
 } from "./SidebarCodexLimits.logic";
@@ -52,7 +53,13 @@ function LimitMeterRow({ window }: { window: CodexLimitWindowView }) {
   );
 }
 
-function CodexLimitsInstanceBlock({ view, showTitle }: { view: CodexLimitsView; showTitle: boolean }) {
+function CodexLimitsInstanceBlock({
+  view,
+  showTitle,
+}: {
+  view: CodexLimitsView;
+  showTitle: boolean;
+}) {
   return (
     <div className="flex flex-col gap-3">
       {showTitle ? (
@@ -65,8 +72,21 @@ function CodexLimitsInstanceBlock({ view, showTitle }: { view: CodexLimitsView; 
 }
 
 export const SidebarCodexLimits = memo(function SidebarCodexLimits() {
-  const providers = useAtomValue(primaryServerProvidersAtom);
-  const views = useMemo(() => getCodexLimitsViews(providers), [providers]);
+  const serverConfigs = useAtomValue(environmentServerConfigsAtom);
+  const { environments } = useEnvironments();
+
+  const views = useMemo(() => {
+    const labelById = new Map(
+      environments.map((environment) => [environment.environmentId, environment.label] as const),
+    );
+    return getCodexLimitsViewsForEnvironments(
+      [...serverConfigs].map(([environmentId, config]) => ({
+        environmentId,
+        environmentLabel: labelById.get(environmentId),
+        providers: config.providers,
+      })),
+    );
+  }, [environments, serverConfigs]);
 
   if (views.length === 0) {
     return null;
@@ -75,8 +95,7 @@ export const SidebarCodexLimits = memo(function SidebarCodexLimits() {
   const summaryRemaining = views
     .flatMap((view) => [view.primary?.remainingPercent, view.secondary?.remainingPercent])
     .filter((value): value is number => typeof value === "number");
-  const lowestRemaining =
-    summaryRemaining.length > 0 ? Math.min(...summaryRemaining) : null;
+  const lowestRemaining = summaryRemaining.length > 0 ? Math.min(...summaryRemaining) : null;
 
   return (
     <Popover>
@@ -113,11 +132,7 @@ export const SidebarCodexLimits = memo(function SidebarCodexLimits() {
         <div className="flex flex-col gap-3 p-3">
           <div className="text-xs font-medium text-foreground">Code usage limits</div>
           {views.map((view) => (
-            <CodexLimitsInstanceBlock
-              key={view.instanceId}
-              view={view}
-              showTitle={views.length > 1}
-            />
+            <CodexLimitsInstanceBlock key={view.viewKey} view={view} showTitle={views.length > 1} />
           ))}
           <a
             className="text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"

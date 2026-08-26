@@ -4,6 +4,7 @@ import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@t3
 import {
   formatRateLimitResetsLabel,
   getCodexLimitsViews,
+  getCodexLimitsViewsForEnvironments,
   labelForRateLimitWindow,
   remainingPercentFromUsed,
 } from "./SidebarCodexLimits.logic";
@@ -133,5 +134,41 @@ describe("SidebarCodexLimits.logic", () => {
       NOW,
     );
     expect(views).toEqual([]);
+  });
+
+  it("aggregates Codex limits across Connect environments (not primary-only)", () => {
+    const views = getCodexLimitsViewsForEnvironments(
+      [
+        {
+          environmentId: "windows-local",
+          environmentLabel: "This PC",
+          providers: [],
+        },
+        {
+          environmentId: "linux-remote",
+          environmentLabel: "Linux",
+          providers: [
+            makeCodexProvider({
+              instanceId: "codex",
+              displayName: "Codex",
+              email: "a@example.com",
+              rateLimits: {
+                primary: {
+                  usedPercent: 9,
+                  resetsAt: Math.floor(NOW / 1000) + 3600,
+                  windowDurationMins: 300,
+                },
+              },
+            }),
+          ],
+        },
+      ],
+      NOW,
+    );
+
+    expect(views).toHaveLength(1);
+    expect(views[0]?.viewKey).toBe("linux-remote:codex");
+    expect(views[0]?.title).toContain("Linux");
+    expect(views[0]?.primary?.remainingPercent).toBe(91);
   });
 });

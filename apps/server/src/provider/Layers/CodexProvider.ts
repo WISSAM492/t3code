@@ -16,6 +16,8 @@ import * as CodexErrors from "effect-codex-app-server/errors";
 import type {
   CodexSettings,
   ServerProvider,
+  ServerProviderRateLimitWindow,
+  ServerProviderRateLimits,
   ServerProviderState,
   ModelCapabilities,
   ProviderOptionDescriptor,
@@ -48,6 +50,39 @@ export interface CodexAppServerProviderSnapshot {
   readonly version: string | undefined;
   readonly models: ReadonlyArray<ServerProviderModel>;
   readonly skills: ReadonlyArray<ServerProviderSkill>;
+  readonly rateLimits?: ServerProviderRateLimits | undefined;
+}
+
+function mapCodexRateLimitWindow(
+  window: CodexSchema.V2GetAccountRateLimitsResponse["rateLimits"]["primary"] | undefined,
+): ServerProviderRateLimitWindow | undefined {
+  if (!window || !Number.isFinite(window.usedPercent)) {
+    return undefined;
+  }
+  return {
+    usedPercent: window.usedPercent,
+    ...(typeof window.resetsAt === "number" ? { resetsAt: window.resetsAt } : {}),
+    ...(typeof window.windowDurationMins === "number"
+      ? { windowDurationMins: window.windowDurationMins }
+      : {}),
+  };
+}
+
+export function mapCodexAccountRateLimits(
+  response: CodexSchema.V2GetAccountRateLimitsResponse | null | undefined,
+): ServerProviderRateLimits | undefined {
+  if (!response?.rateLimits) {
+    return undefined;
+  }
+  const primary = mapCodexRateLimitWindow(response.rateLimits.primary);
+  const secondary = mapCodexRateLimitWindow(response.rateLimits.secondary);
+  if (!primary && !secondary) {
+    return undefined;
+  }
+  return {
+    ...(primary ? { primary } : {}),
+    ...(secondary ? { secondary } : {}),
+  };
 }
 
 const REASONING_EFFORT_LABELS: Readonly<Record<string, string>> = {
@@ -394,15 +429,22 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
     } satisfies CodexAppServerProviderSnapshot;
   }
 
-  const [skillsResponse, models] = yield* Effect.all(
+  const [skillsResponse, models, rateLimitsResponse] = yield* Effect.all(
     [
       client.request("skills/list", {
         cwds: [input.cwd],
       }),
       requestAllCodexModels(client),
+      // Best-effort: older CLIs / API-key auth may not report ChatGPT limits.
+      // Never fail the whole provider probe for missing rate limits.
+      client
+        .request("account/rateLimits/read", undefined)
+        .pipe(Effect.orElseSucceed((): CodexSchema.V2GetAccountRateLimitsResponse | null => null)),
     ],
     { concurrency: "unbounded" },
   );
+
+  const rateLimits = mapCodexAccountRateLimits(rateLimitsResponse);
 
   return {
     account: accountResponse,
@@ -411,6 +453,7 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
       appendCustomCodexModels(models, input.customModels ?? []),
     ),
     skills: parseCodexSkillsListResponse(skillsResponse, input.cwd),
+    ...(rateLimits ? { rateLimits } : {}),
   } satisfies CodexAppServerProviderSnapshot;
 });
 
@@ -641,27 +684,30 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
   const snapshot = probeResult.success.value;
   const accountStatus = accountProbeStatus(snapshot.account);
 
-  return buildServerProvider({
-    presentation: CODEX_PRESENTATION,
-    enabled: codexSettings.enabled,
-    checkedAt,
-    models: snapshot.models,
-    skills: snapshot.skills,
-    slashCommands: [
-      {
-        name: "feedback",
-        description: "Send this thread and Codex logs to OpenAI",
-        input: { hint: "Describe the issue (optional)" },
+  return {
+    ...buildServerProvider({
+      presentation: CODEX_PRESENTATION,
+      enabled: codexSettings.enabled,
+      checkedAt,
+      models: snapshot.models,
+      skills: snapshot.skills,
+      slashCommands: [
+        {
+          name: "feedback",
+          description: "Send this thread and Codex logs to OpenAI",
+          input: { hint: "Describe the issue (optional)" },
+        },
+      ],
+      probe: {
+        installed: true,
+        version: snapshot.version ?? null,
+        status: accountStatus.status,
+        auth: accountStatus.auth,
+        ...(accountStatus.message ? { message: accountStatus.message } : {}),
       },
-    ],
-    probe: {
-      installed: true,
-      version: snapshot.version ?? null,
-      status: accountStatus.status,
-      auth: accountStatus.auth,
-      ...(accountStatus.message ? { message: accountStatus.message } : {}),
-    },
-  });
+    }),
+    ...(snapshot.rateLimits ? { rateLimits: snapshot.rateLimits } : {}),
+  };
 });
 
 // NOTE: the singleton `CodexProviderLive` Layer has been removed as part of

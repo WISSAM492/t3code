@@ -5,15 +5,24 @@ export type CodexLimitWindowView = {
   readonly remainingPercent: number;
   readonly usedPercent: number;
   readonly resetsLabel: string | null;
+  readonly isCritical: boolean;
 };
 
 export type CodexLimitsView = {
   /** Stable React key; includes environment id for Connect remotes. */
   readonly viewKey: string;
   readonly instanceId: string;
+  /** Primary line: usually the account email. */
   readonly title: string;
+  /** Optional secondary line (display name) when it adds information. */
+  readonly subtitle: string | null;
+  readonly accentColor: string | null;
   readonly primary: CodexLimitWindowView | null;
   readonly secondary: CodexLimitWindowView | null;
+  /** Worst remaining across this account's windows. */
+  readonly worstRemainingPercent: number;
+  readonly isCritical: boolean;
+  readonly isDepleted: boolean;
 };
 
 export type CodexLimitsEnvironmentInput = {
@@ -21,6 +30,17 @@ export type CodexLimitsEnvironmentInput = {
   readonly environmentLabel?: string | undefined;
   readonly providers: ReadonlyArray<ServerProvider>;
 };
+
+export type CodexLimitsSummary = {
+  /** Usable remaining: min among windows that still have > 0 left. */
+  readonly displayPercent: number | null;
+  readonly hasCritical: boolean;
+  readonly depletedAccountCount: number;
+  readonly criticalAccountCount: number;
+  readonly alertMessage: string | null;
+};
+
+const CRITICAL_REMAINING_PERCENT = 10;
 
 function clampPercent(value: number): number {
   if (!Number.isFinite(value)) return 0;
@@ -93,32 +113,41 @@ function toWindowView(
     return null;
   }
   const usedPercent = clampPercent(window.usedPercent);
+  const remainingPercent = remainingPercentFromUsed(usedPercent);
   return {
     label: labelForRateLimitWindow(window, fallbackLabel),
     usedPercent,
-    remainingPercent: remainingPercentFromUsed(usedPercent),
+    remainingPercent,
     resetsLabel: formatRateLimitResetsLabel(window.resetsAt, nowMs),
+    isCritical: remainingPercent <= CRITICAL_REMAINING_PERCENT,
   };
 }
 
-function instanceTitle(
+function accountTitleParts(
   provider: ServerProvider,
   options: {
-    readonly includeEmail: boolean;
     readonly environmentLabel?: string | undefined;
     readonly includeEnvironmentLabel: boolean;
   },
-): string {
-  const name = provider.displayName?.trim() || "Codex";
-  const email = provider.auth.email?.trim();
-  const parts = [name];
-  if (options.includeEmail && email) {
-    parts.push(email);
+): { readonly title: string; readonly subtitle: string | null } {
+  const email = provider.auth.email?.trim() || null;
+  const displayName = provider.displayName?.trim() || null;
+  const environmentLabel = options.environmentLabel?.trim() || null;
+
+  // Prefer email as the identity users recognize across "2nd"/"3rd" labels.
+  const title = email ?? displayName ?? "Codex";
+  const subtitleParts: string[] = [];
+  if (email && displayName && displayName.toLowerCase() !== "codex") {
+    subtitleParts.push(displayName);
   }
-  if (options.includeEnvironmentLabel && options.environmentLabel?.trim()) {
-    parts.push(options.environmentLabel.trim());
+  if (options.includeEnvironmentLabel && environmentLabel) {
+    subtitleParts.push(environmentLabel);
   }
-  return parts.join(" · ");
+
+  return {
+    title,
+    subtitle: subtitleParts.length > 0 ? subtitleParts.join(" · ") : null,
+  };
 }
 
 function isCodexLimitsProvider(provider: ServerProvider): boolean {
@@ -130,6 +159,59 @@ function isCodexLimitsProvider(provider: ServerProvider): boolean {
     provider.rateLimits !== undefined &&
     (provider.rateLimits.primary !== undefined || provider.rateLimits.secondary !== undefined)
   );
+}
+
+function worstRemaining(
+  primary: CodexLimitWindowView | null,
+  secondary: CodexLimitWindowView | null,
+): number {
+  const values = [primary?.remainingPercent, secondary?.remainingPercent].filter(
+    (value): value is number => typeof value === "number",
+  );
+  return values.length > 0 ? Math.min(...values) : 100;
+}
+
+/**
+ * Sidebar button summary:
+ * - percent = lowest remaining among windows that still have capacity (> 0)
+ * - if every window is depleted, percent = 0
+ * - critical when any account is ≤ 10% (including 0%)
+ */
+export function summarizeCodexLimitsViews(
+  views: ReadonlyArray<CodexLimitsView>,
+): CodexLimitsSummary {
+  const usablePercents = views
+    .flatMap((view) => [view.primary?.remainingPercent, view.secondary?.remainingPercent])
+    .filter((value): value is number => typeof value === "number" && value > 0);
+  const allPercents = views
+    .flatMap((view) => [view.primary?.remainingPercent, view.secondary?.remainingPercent])
+    .filter((value): value is number => typeof value === "number");
+
+  const depletedAccountCount = views.filter((view) => view.isDepleted).length;
+  const criticalAccountCount = views.filter((view) => view.isCritical).length;
+  const displayPercent =
+    usablePercents.length > 0 ? Math.min(...usablePercents) : allPercents.length > 0 ? 0 : null;
+
+  let alertMessage: string | null = null;
+  if (depletedAccountCount > 0 && criticalAccountCount > depletedAccountCount) {
+    alertMessage = `${depletedAccountCount} empty · ${criticalAccountCount - depletedAccountCount} low`;
+  } else if (depletedAccountCount === 1) {
+    alertMessage = "1 account has 0% remaining";
+  } else if (depletedAccountCount > 1) {
+    alertMessage = `${depletedAccountCount} accounts have 0% remaining`;
+  } else if (criticalAccountCount === 1) {
+    alertMessage = "1 account is below 10% remaining";
+  } else if (criticalAccountCount > 1) {
+    alertMessage = `${criticalAccountCount} accounts are below 10% remaining`;
+  }
+
+  return {
+    displayPercent,
+    hasCritical: criticalAccountCount > 0,
+    depletedAccountCount,
+    criticalAccountCount,
+    alertMessage,
+  };
 }
 
 /**
@@ -160,10 +242,11 @@ export function getCodexLimitsViewsForEnvironments(
     })),
   );
 
-  const includeEmail = candidates.length > 1;
-  // Use the full environment list (not only those with limits) so a Windows
-  // local + Linux Connect pair still labels the remote host clearly.
-  const includeEnvironmentLabel = environments.length > 1;
+  // Only label environments when limits actually come from more than one host.
+  // A Windows local + Linux Connect pair with limits only on Linux should not
+  // append the machine name to every row.
+  const includeEnvironmentLabel =
+    new Set(candidates.map((candidate) => candidate.environment.environmentId)).size > 1;
 
   return candidates.flatMap(({ environment, provider }) => {
     const primary = toWindowView(provider.rateLimits?.primary, "5 hour limit", nowMs);
@@ -171,16 +254,22 @@ export function getCodexLimitsViewsForEnvironments(
     if (!primary && !secondary) {
       return [];
     }
+    const remaining = worstRemaining(primary, secondary);
+    const { title, subtitle } = accountTitleParts(provider, {
+      includeEnvironmentLabel,
+      environmentLabel: environment.environmentLabel,
+    });
     const view: CodexLimitsView = {
       viewKey: `${environment.environmentId}:${provider.instanceId}`,
       instanceId: provider.instanceId,
-      title: instanceTitle(provider, {
-        includeEmail,
-        includeEnvironmentLabel,
-        environmentLabel: environment.environmentLabel,
-      }),
+      title,
+      subtitle,
+      accentColor: provider.accentColor?.trim() || null,
       primary,
       secondary,
+      worstRemainingPercent: remaining,
+      isCritical: remaining <= CRITICAL_REMAINING_PERCENT,
+      isDepleted: remaining === 0,
     };
     return [view];
   });

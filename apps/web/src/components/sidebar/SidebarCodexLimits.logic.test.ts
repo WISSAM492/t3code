@@ -7,6 +7,7 @@ import {
   getCodexLimitsViewsForEnvironments,
   labelForRateLimitWindow,
   remainingPercentFromUsed,
+  summarizeCodexLimitsViews,
 } from "./SidebarCodexLimits.logic";
 
 const CODEX = ProviderDriverKind.make("codex");
@@ -16,6 +17,7 @@ function makeCodexProvider(input: {
   instanceId: string;
   displayName?: string;
   email?: string;
+  accentColor?: string;
   rateLimits?: ServerProvider["rateLimits"];
   enabled?: boolean;
   authStatus?: ServerProvider["auth"]["status"];
@@ -24,6 +26,7 @@ function makeCodexProvider(input: {
     instanceId: ProviderInstanceId.make(input.instanceId),
     driver: CODEX,
     displayName: input.displayName,
+    accentColor: input.accentColor,
     enabled: input.enabled ?? true,
     installed: true,
     version: "0.145.0",
@@ -67,13 +70,14 @@ describe("SidebarCodexLimits.logic", () => {
     expect(formatRateLimitResetsLabel(past, NOW)).toBe("Reset");
   });
 
-  it("builds views for authenticated Codex instances with limits", () => {
+  it("prefers email titles and keeps displayName as subtitle", () => {
     const views = getCodexLimitsViews(
       [
         makeCodexProvider({
           instanceId: "codex",
           displayName: "Codex",
           email: "a@example.com",
+          accentColor: "#111111",
           rateLimits: {
             primary: {
               usedPercent: 13,
@@ -91,6 +95,7 @@ describe("SidebarCodexLimits.logic", () => {
           instanceId: "codex_2nd",
           displayName: "2nd",
           email: "b@example.com",
+          accentColor: "#2563eb",
           rateLimits: {
             primary: {
               usedPercent: 40,
@@ -99,22 +104,45 @@ describe("SidebarCodexLimits.logic", () => {
             },
           },
         }),
-        makeCodexProvider({
-          instanceId: "codex_empty",
-          displayName: "Empty",
-        }),
       ],
       NOW,
     );
 
     expect(views).toHaveLength(2);
-    expect(views[0]?.title).toContain("Codex");
-    expect(views[0]?.title).toContain("a@example.com");
-    expect(views[0]?.primary?.remainingPercent).toBe(87);
-    expect(views[0]?.primary?.label).toBe("5 hour limit");
-    expect(views[0]?.secondary?.remainingPercent).toBe(100);
-    expect(views[1]?.title).toContain("2nd");
-    expect(views[1]?.secondary).toBeNull();
+    expect(views[0]?.title).toBe("a@example.com");
+    expect(views[0]?.subtitle).toBeNull();
+    expect(views[1]?.title).toBe("b@example.com");
+    expect(views[1]?.subtitle).toBe("2nd");
+    expect(views[1]?.accentColor).toBe("#2563eb");
+  });
+
+  it("summarizes usable remaining without letting one empty account dominate", () => {
+    const views = getCodexLimitsViews(
+      [
+        makeCodexProvider({
+          instanceId: "codex",
+          email: "a@example.com",
+          rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300 } },
+        }),
+        makeCodexProvider({
+          instanceId: "codex_2nd",
+          email: "b@example.com",
+          rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300 } },
+        }),
+        makeCodexProvider({
+          instanceId: "codex_3rd",
+          email: "c@example.com",
+          rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300 } },
+        }),
+      ],
+      NOW,
+    );
+
+    const summary = summarizeCodexLimitsViews(views);
+    expect(summary.displayPercent).toBe(100);
+    expect(summary.depletedAccountCount).toBe(1);
+    expect(summary.hasCritical).toBe(true);
+    expect(summary.alertMessage).toBe("1 account has 0% remaining");
   });
 
   it("hides unauthenticated or disabled providers", () => {
@@ -136,7 +164,7 @@ describe("SidebarCodexLimits.logic", () => {
     expect(views).toEqual([]);
   });
 
-  it("aggregates Codex limits across Connect environments (not primary-only)", () => {
+  it("aggregates Codex limits across Connect environments without labeling a single remote host", () => {
     const views = getCodexLimitsViewsForEnvironments(
       [
         {
@@ -168,7 +196,8 @@ describe("SidebarCodexLimits.logic", () => {
 
     expect(views).toHaveLength(1);
     expect(views[0]?.viewKey).toBe("linux-remote:codex");
-    expect(views[0]?.title).toContain("Linux");
+    expect(views[0]?.title).toBe("a@example.com");
+    expect(views[0]?.subtitle).toBeNull();
     expect(views[0]?.primary?.remainingPercent).toBe(91);
   });
 });

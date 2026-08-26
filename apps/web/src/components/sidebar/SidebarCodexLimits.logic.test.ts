@@ -116,30 +116,31 @@ describe("SidebarCodexLimits.logic", () => {
     expect(views[1]?.accentColor).toBe("#2563eb");
   });
 
-  it("summarizes usable remaining without letting one empty account dominate", () => {
+  it("summarizes button percent as the average of 5 hour remaining across accounts", () => {
     const views = getCodexLimitsViews(
       [
         makeCodexProvider({
           instanceId: "codex",
           email: "a@example.com",
-          rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300 } },
+          rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300 } },
         }),
         makeCodexProvider({
           instanceId: "codex_2nd",
           email: "b@example.com",
-          rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300 } },
+          rateLimits: { primary: { usedPercent: 7, windowDurationMins: 300 } },
         }),
         makeCodexProvider({
           instanceId: "codex_3rd",
           email: "c@example.com",
-          rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300 } },
+          rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300 } },
         }),
       ],
       NOW,
     );
 
+    // (0 + 93 + 100) / 3 = 64.333… → 64
     const summary = summarizeCodexLimitsViews(views);
-    expect(summary.displayPercent).toBe(100);
+    expect(summary.displayPercent).toBe(64);
     expect(summary.depletedAccountCount).toBe(1);
     expect(summary.hasCritical).toBe(true);
     expect(summary.alertMessage).toBe("1 account has 0% remaining");

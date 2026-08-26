@@ -115,9 +115,9 @@ token/cost charts on the **Usage** page.
 Limits are read from every connected environment, so a Windows desktop client connected to a Linux
 host over T3 Connect still shows the host's Codex remaining usage.
 
-The sidebar control summarizes usable remaining capacity (it does not jump to 0% just because one
-extra account is empty). Accounts are labeled by email, with optional accent colors, and a light
-warning appears when any account drops to 10% or below.
+The sidebar control shows the average 5-hour remaining across Codex accounts. Accounts are labeled
+by email, with optional accent colors, and a light warning appears when any account drops to 10% or
+below.
 
 Limits refresh with provider status (about every few minutes). If Codex does not report limits
 (API key auth, older CLI, or temporary probe failure), the control stays hidden.

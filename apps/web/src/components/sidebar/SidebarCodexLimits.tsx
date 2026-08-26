@@ -184,14 +184,6 @@ export const SidebarCodexLimits = memo(function SidebarCodexLimits() {
           {views.map((view) => (
             <CodexLimitsInstanceBlock key={view.viewKey} view={view} showTitle={views.length > 1} />
           ))}
-          <a
-            className="text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-            href="https://chatgpt.com/codex/settings/usage"
-            target="_blank"
-            rel="noreferrer"
-          >
-            View more usage stats
-          </a>
         </div>
       </PopoverPopup>
     </Popover>

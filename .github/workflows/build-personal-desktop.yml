@@ -79,7 +79,7 @@ jobs:
       T3CODE_CLERK_JWT_TEMPLATE: t3-relay
       T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: hzxSgY2cH10sDU2r
       T3CODE_RELAY_URL: https://relay.t3.codes
-      T3CODE_DESKTOP_VERSION: 0.0.34-codex-limits.3
+      T3CODE_DESKTOP_VERSION: 0.0.34-codex-limits.4
     steps:
       - name: Checkout
         uses: actions/checkout@v6

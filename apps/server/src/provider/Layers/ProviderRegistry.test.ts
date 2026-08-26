@@ -449,6 +449,42 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           }),
       );
 
+      it.effect("attaches mapped ChatGPT rate limits when the probe reports them", () =>
+        Effect.gen(function* () {
+          const status = yield* checkCodexProviderStatus(defaultCodexSettings, () =>
+            Effect.succeed(
+              makeCodexProbeSnapshot({
+                rateLimits: {
+                  primary: {
+                    usedPercent: 13,
+                    resetsAt: 1_777_000_000,
+                    windowDurationMins: 300,
+                  },
+                  secondary: {
+                    usedPercent: 0,
+                    resetsAt: 1_777_500_000,
+                    windowDurationMins: 10_080,
+                  },
+                },
+              }),
+            ),
+          );
+
+          assert.deepStrictEqual(status.rateLimits, {
+            primary: {
+              usedPercent: 13,
+              resetsAt: 1_777_000_000,
+              windowDurationMins: 300,
+            },
+            secondary: {
+              usedPercent: 0,
+              resetsAt: 1_777_500_000,
+              windowDurationMins: 10_080,
+            },
+          });
+        }),
+      );
+
       it.effect("returns an api key label for codex api key auth", () =>
         Effect.gen(function* () {
           const status = yield* checkCodexProviderStatus(defaultCodexSettings, () =>

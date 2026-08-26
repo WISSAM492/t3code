@@ -173,24 +173,24 @@ function worstRemaining(
 
 /**
  * Sidebar button summary:
- * - percent = lowest remaining among windows that still have capacity (> 0)
- * - if every window is depleted, percent = 0
+ * - percent = average of each account's **5 hour** (primary) remaining
  * - critical when any account is ≤ 10% (including 0%)
  */
 export function summarizeCodexLimitsViews(
   views: ReadonlyArray<CodexLimitsView>,
 ): CodexLimitsSummary {
-  const usablePercents = views
-    .flatMap((view) => [view.primary?.remainingPercent, view.secondary?.remainingPercent])
-    .filter((value): value is number => typeof value === "number" && value > 0);
-  const allPercents = views
-    .flatMap((view) => [view.primary?.remainingPercent, view.secondary?.remainingPercent])
+  const fiveHourPercents = views
+    .map((view) => view.primary?.remainingPercent)
     .filter((value): value is number => typeof value === "number");
 
   const depletedAccountCount = views.filter((view) => view.isDepleted).length;
   const criticalAccountCount = views.filter((view) => view.isCritical).length;
   const displayPercent =
-    usablePercents.length > 0 ? Math.min(...usablePercents) : allPercents.length > 0 ? 0 : null;
+    fiveHourPercents.length > 0
+      ? Math.round(
+          fiveHourPercents.reduce((sum, value) => sum + value, 0) / fiveHourPercents.length,
+        )
+      : null;
 
   let alertMessage: string | null = null;
   if (depletedAccountCount > 0 && criticalAccountCount > depletedAccountCount) {

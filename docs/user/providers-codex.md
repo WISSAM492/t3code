@@ -121,6 +121,17 @@ click the blurred email to reveal it.
 
 Use display names and accent colors to make accounts easy to tell apart in the model picker.
 
+## Remaining ChatGPT Usage Limits
+
+When a Codex account reports subscription rate limits, the sidebar footer shows a **Limits** control.
+
+Open it to see remaining **5 hour** and **Weekly** usage for each authenticated Codex provider
+instance (including extras like `2nd` / `3rd`). This is ChatGPT/Codex plan remaining usage — not the
+token/cost charts on the **Usage** page.
+
+Limits refresh with provider status (about every few minutes). If Codex does not report limits
+(API key auth, older CLI, or temporary probe failure), the control stays hidden.
+
 ## I Need A Different API Key Or Endpoint
 
 Use the provider's Environment variables section in Settings.

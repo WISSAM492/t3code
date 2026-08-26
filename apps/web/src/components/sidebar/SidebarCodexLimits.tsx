@@ -25,7 +25,7 @@ function AccountMark({
     <span
       aria-hidden
       className={cn(
-        "mt-0.5 size-2.5 shrink-0 rounded-full ring-1 ring-border/60",
+        "size-2 shrink-0 rounded-full ring-1 ring-border/60",
         isCritical && !accentColor ? "bg-warning" : "bg-muted-foreground/50",
       )}
       style={accentColor ? { backgroundColor: accentColor } : undefined}
@@ -33,24 +33,27 @@ function AccountMark({
   );
 }
 
+function compactWindowLabel(label: string): string {
+  if (label.startsWith("5 hour")) return "5 hour";
+  if (label.startsWith("Weekly")) return "Weekly";
+  return label.replace(/ limit$/i, "");
+}
+
 function LimitMeterRow({ window }: { window: CodexLimitWindowView }) {
   const usedForBar = Math.max(0, Math.min(100, window.usedPercent));
 
   return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex items-baseline justify-between gap-3">
-        <div className="text-xs font-medium text-foreground">{window.label}</div>
-        <div
-          className={cn(
-            "text-[11px] font-medium tabular-nums",
-            window.isCritical ? "text-warning" : "text-foreground",
-          )}
-        >
-          {window.remainingPercent}% left
-        </div>
+    <div
+      className="grid grid-cols-[3.25rem_minmax(0,1fr)_2rem_minmax(4.5rem,auto)] items-center gap-x-1.5"
+      title={[window.label, `${window.remainingPercent}% left`, window.resetsLabel]
+        .filter(Boolean)
+        .join(" · ")}
+    >
+      <div className="truncate text-[11px] text-muted-foreground">
+        {compactWindowLabel(window.label)}
       </div>
       <div
-        className="h-1.5 w-full overflow-hidden rounded-full bg-muted/60"
+        className="h-1 w-full overflow-hidden rounded-full bg-muted/60"
         role="progressbar"
         aria-valuemin={0}
         aria-valuemax={100}
@@ -65,9 +68,17 @@ function LimitMeterRow({ window }: { window: CodexLimitWindowView }) {
           style={{ width: `${100 - usedForBar}%` }}
         />
       </div>
-      {window.resetsLabel ? (
-        <div className="text-[11px] text-muted-foreground">{window.resetsLabel}</div>
-      ) : null}
+      <div
+        className={cn(
+          "text-right text-[11px] font-medium tabular-nums",
+          window.isCritical ? "text-warning" : "text-foreground",
+        )}
+      >
+        {window.remainingPercent}%
+      </div>
+      <div className="truncate text-right text-[10px] text-muted-foreground">
+        {window.resetsLabel ?? "—"}
+      </div>
     </div>
   );
 }
@@ -81,23 +92,26 @@ function CodexLimitsInstanceBlock({
 }) {
   return (
     <div
-      className={cn("flex flex-col gap-3 rounded-md p-2 -mx-1", view.isCritical && "bg-warning/8")}
+      className={cn(
+        "flex flex-col gap-1 rounded-md px-1.5 py-1",
+        view.isCritical && "bg-warning/8",
+      )}
     >
       {showTitle ? (
-        <div className="flex items-start gap-2 min-w-0">
+        <div className="flex min-w-0 items-center gap-1.5">
           <AccountMark accentColor={view.accentColor} isCritical={view.isCritical} />
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-xs font-medium text-foreground">{view.title}</div>
+          <div className="min-w-0 flex-1 truncate text-[11px] font-medium text-foreground">
+            {view.title}
             {view.subtitle ? (
-              <div className="truncate text-[11px] text-muted-foreground">{view.subtitle}</div>
+              <span className="font-normal text-muted-foreground"> · {view.subtitle}</span>
             ) : null}
           </div>
           {view.isDepleted ? (
-            <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-warning">
+            <span className="shrink-0 text-[9px] font-medium uppercase tracking-wide text-warning">
               Empty
             </span>
           ) : view.isCritical ? (
-            <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-warning">
+            <span className="shrink-0 text-[9px] font-medium uppercase tracking-wide text-warning">
               Low
             </span>
           ) : null}
@@ -171,13 +185,13 @@ export const SidebarCodexLimits = memo(function SidebarCodexLimits() {
         side="top"
         align="start"
         sideOffset={8}
-        className="w-72 max-w-none text-left whitespace-normal"
+        className="w-[19.5rem] max-w-none text-left whitespace-normal"
         viewportClassName="p-0"
       >
-        <div className="flex flex-col gap-3 p-3">
-          <div className="text-xs font-medium text-foreground">Code usage limits</div>
+        <div className="flex flex-col gap-1 p-2">
+          <div className="px-1 text-[11px] font-medium text-foreground">Code usage limits</div>
           {summary.alertMessage ? (
-            <div className="rounded-md bg-warning/10 px-2 py-1.5 text-[11px] text-warning">
+            <div className="rounded-md bg-warning/10 px-1.5 py-1 text-[10px] text-warning">
               {summary.alertMessage}
             </div>
           ) : null}

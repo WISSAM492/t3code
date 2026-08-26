@@ -9,13 +9,32 @@ import { Button } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import {
   getCodexLimitsViewsForEnvironments,
+  summarizeCodexLimitsViews,
   type CodexLimitWindowView,
   type CodexLimitsView,
 } from "./SidebarCodexLimits.logic";
 
+function AccountMark({
+  accentColor,
+  isCritical,
+}: {
+  accentColor: string | null;
+  isCritical: boolean;
+}) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "mt-0.5 size-2.5 shrink-0 rounded-full ring-1 ring-border/60",
+        isCritical && !accentColor ? "bg-warning" : "bg-muted-foreground/50",
+      )}
+      style={accentColor ? { backgroundColor: accentColor } : undefined}
+    />
+  );
+}
+
 function LimitMeterRow({ window }: { window: CodexLimitWindowView }) {
   const usedForBar = Math.max(0, Math.min(100, window.usedPercent));
-  const lowRemaining = window.remainingPercent <= 10;
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -24,7 +43,7 @@ function LimitMeterRow({ window }: { window: CodexLimitWindowView }) {
         <div
           className={cn(
             "text-[11px] font-medium tabular-nums",
-            lowRemaining ? "text-warning" : "text-foreground",
+            window.isCritical ? "text-warning" : "text-foreground",
           )}
         >
           {window.remainingPercent}% left
@@ -41,7 +60,7 @@ function LimitMeterRow({ window }: { window: CodexLimitWindowView }) {
         <div
           className={cn(
             "h-full rounded-full transition-[width,background-color] duration-500 ease-out motion-reduce:transition-none",
-            lowRemaining ? "bg-warning" : "bg-foreground/70",
+            window.isCritical ? "bg-warning" : "bg-foreground/70",
           )}
           style={{ width: `${100 - usedForBar}%` }}
         />
@@ -61,9 +80,28 @@ function CodexLimitsInstanceBlock({
   showTitle: boolean;
 }) {
   return (
-    <div className="flex flex-col gap-3">
+    <div
+      className={cn("flex flex-col gap-3 rounded-md p-2 -mx-1", view.isCritical && "bg-warning/8")}
+    >
       {showTitle ? (
-        <div className="truncate text-[11px] font-medium text-muted-foreground">{view.title}</div>
+        <div className="flex items-start gap-2 min-w-0">
+          <AccountMark accentColor={view.accentColor} isCritical={view.isCritical} />
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-xs font-medium text-foreground">{view.title}</div>
+            {view.subtitle ? (
+              <div className="truncate text-[11px] text-muted-foreground">{view.subtitle}</div>
+            ) : null}
+          </div>
+          {view.isDepleted ? (
+            <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-warning">
+              Empty
+            </span>
+          ) : view.isCritical ? (
+            <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-warning">
+              Low
+            </span>
+          ) : null}
+        </div>
       ) : null}
       {view.primary ? <LimitMeterRow window={view.primary} /> : null}
       {view.secondary ? <LimitMeterRow window={view.secondary} /> : null}
@@ -88,14 +126,11 @@ export const SidebarCodexLimits = memo(function SidebarCodexLimits() {
     );
   }, [environments, serverConfigs]);
 
+  const summary = useMemo(() => summarizeCodexLimitsViews(views), [views]);
+
   if (views.length === 0) {
     return null;
   }
-
-  const summaryRemaining = views
-    .flatMap((view) => [view.primary?.remainingPercent, view.secondary?.remainingPercent])
-    .filter((value): value is number => typeof value === "number");
-  const lowestRemaining = summaryRemaining.length > 0 ? Math.min(...summaryRemaining) : null;
 
   return (
     <Popover>
@@ -104,20 +139,30 @@ export const SidebarCodexLimits = memo(function SidebarCodexLimits() {
           <Button
             variant="ghost"
             size="sm"
-            className="mb-1 h-8 w-full justify-start gap-2 px-2 text-xs text-muted-foreground hover:text-foreground"
-            aria-label="Code usage limits"
+            className={cn(
+              "mb-1 h-8 w-full justify-start gap-2 px-2 text-xs",
+              summary.hasCritical
+                ? "text-warning hover:text-warning"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+            aria-label={
+              summary.alertMessage
+                ? `Code usage limits. ${summary.alertMessage}`
+                : "Code usage limits"
+            }
           >
-            <ChartNoAxesColumnIcon className="size-3.5 shrink-0 opacity-80" />
+            <span className="relative shrink-0">
+              <ChartNoAxesColumnIcon className="size-3.5 opacity-80" />
+              {summary.hasCritical ? (
+                <span
+                  aria-hidden
+                  className="absolute -right-0.5 -top-0.5 size-1.5 rounded-full bg-warning"
+                />
+              ) : null}
+            </span>
             <span className="min-w-0 flex-1 truncate text-left">Limits</span>
-            {lowestRemaining !== null ? (
-              <span
-                className={cn(
-                  "tabular-nums text-[11px]",
-                  lowestRemaining <= 10 ? "text-warning" : "text-muted-foreground",
-                )}
-              >
-                {lowestRemaining}%
-              </span>
+            {summary.displayPercent !== null ? (
+              <span className="tabular-nums text-[11px]">{summary.displayPercent}%</span>
             ) : null}
           </Button>
         }
@@ -131,6 +176,11 @@ export const SidebarCodexLimits = memo(function SidebarCodexLimits() {
       >
         <div className="flex flex-col gap-3 p-3">
           <div className="text-xs font-medium text-foreground">Code usage limits</div>
+          {summary.alertMessage ? (
+            <div className="rounded-md bg-warning/10 px-2 py-1.5 text-[11px] text-warning">
+              {summary.alertMessage}
+            </div>
+          ) : null}
           {views.map((view) => (
             <CodexLimitsInstanceBlock key={view.viewKey} view={view} showTitle={views.length > 1} />
           ))}

@@ -8,10 +8,18 @@ export type CodexLimitWindowView = {
 };
 
 export type CodexLimitsView = {
+  /** Stable React key; includes environment id for Connect remotes. */
+  readonly viewKey: string;
   readonly instanceId: string;
   readonly title: string;
   readonly primary: CodexLimitWindowView | null;
   readonly secondary: CodexLimitWindowView | null;
+};
+
+export type CodexLimitsEnvironmentInput = {
+  readonly environmentId: string;
+  readonly environmentLabel?: string | undefined;
+  readonly providers: ReadonlyArray<ServerProvider>;
 };
 
 function clampPercent(value: number): number {
@@ -93,44 +101,84 @@ function toWindowView(
   };
 }
 
-function instanceTitle(provider: ServerProvider, includeEmail: boolean): string {
+function instanceTitle(
+  provider: ServerProvider,
+  options: {
+    readonly includeEmail: boolean;
+    readonly environmentLabel?: string | undefined;
+    readonly includeEnvironmentLabel: boolean;
+  },
+): string {
   const name = provider.displayName?.trim() || "Codex";
   const email = provider.auth.email?.trim();
-  if (includeEmail && email) {
-    return `${name} · ${email}`;
+  const parts = [name];
+  if (options.includeEmail && email) {
+    parts.push(email);
   }
-  return name;
+  if (options.includeEnvironmentLabel && options.environmentLabel?.trim()) {
+    parts.push(options.environmentLabel.trim());
+  }
+  return parts.join(" · ");
+}
+
+function isCodexLimitsProvider(provider: ServerProvider): boolean {
+  return (
+    provider.driver === "codex" &&
+    provider.enabled &&
+    provider.installed &&
+    provider.auth.status === "authenticated" &&
+    provider.rateLimits !== undefined &&
+    (provider.rateLimits.primary !== undefined || provider.rateLimits.secondary !== undefined)
+  );
 }
 
 /**
  * Build sidebar views for every enabled, authenticated Codex instance that
- * reported rate limits. Returns empty when nothing should render.
+ * reported rate limits. Prefer {@link getCodexLimitsViewsForEnvironments} when
+ * T3 Connect remotes are involved — primary-only misses remote Linux hosts.
  */
 export function getCodexLimitsViews(
   providers: ReadonlyArray<ServerProvider>,
   nowMs: number = Date.now(),
 ): ReadonlyArray<CodexLimitsView> {
-  const codexProviders = providers.filter(
-    (provider) =>
-      provider.driver === "codex" &&
-      provider.enabled &&
-      provider.installed &&
-      provider.auth.status === "authenticated" &&
-      provider.rateLimits !== undefined &&
-      (provider.rateLimits.primary !== undefined || provider.rateLimits.secondary !== undefined),
+  return getCodexLimitsViewsForEnvironments([{ environmentId: "local", providers }], nowMs);
+}
+
+/**
+ * Same as {@link getCodexLimitsViews}, but across every connected environment.
+ * Windows Desktop + T3 Connect keeps Codex on the remote Linux environment while
+ * `PrimaryConnectionTarget` stays local — aggregating all configs fixes that.
+ */
+export function getCodexLimitsViewsForEnvironments(
+  environments: ReadonlyArray<CodexLimitsEnvironmentInput>,
+  nowMs: number = Date.now(),
+): ReadonlyArray<CodexLimitsView> {
+  const candidates = environments.flatMap((environment) =>
+    environment.providers.filter(isCodexLimitsProvider).map((provider) => ({
+      environment,
+      provider,
+    })),
   );
 
-  const includeEmail = codexProviders.length > 1;
+  const includeEmail = candidates.length > 1;
+  // Use the full environment list (not only those with limits) so a Windows
+  // local + Linux Connect pair still labels the remote host clearly.
+  const includeEnvironmentLabel = environments.length > 1;
 
-  return codexProviders.flatMap((provider) => {
+  return candidates.flatMap(({ environment, provider }) => {
     const primary = toWindowView(provider.rateLimits?.primary, "5 hour limit", nowMs);
     const secondary = toWindowView(provider.rateLimits?.secondary, "Weekly limit", nowMs);
     if (!primary && !secondary) {
       return [];
     }
     const view: CodexLimitsView = {
+      viewKey: `${environment.environmentId}:${provider.instanceId}`,
       instanceId: provider.instanceId,
-      title: instanceTitle(provider, includeEmail),
+      title: instanceTitle(provider, {
+        includeEmail,
+        includeEnvironmentLabel,
+        environmentLabel: environment.environmentLabel,
+      }),
       primary,
       secondary,
     };

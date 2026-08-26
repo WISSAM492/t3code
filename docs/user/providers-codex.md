@@ -129,6 +129,9 @@ Open it to see remaining **5 hour** and **Weekly** usage for each authenticated 
 instance (including extras like `2nd` / `3rd`). This is ChatGPT/Codex plan remaining usage — not the
 token/cost charts on the **Usage** page.
 
+Limits are read from every connected environment, so a Windows desktop client connected to a Linux
+host over T3 Connect still shows the host's Codex remaining usage.
+
 Limits refresh with provider status (about every few minutes). If Codex does not report limits
 (API key auth, older CLI, or temporary probe failure), the control stays hidden.
 

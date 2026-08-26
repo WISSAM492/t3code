@@ -184,6 +184,24 @@ export const ServerProviderUpdateState = Schema.Struct({
 });
 export type ServerProviderUpdateState = typeof ServerProviderUpdateState.Type;
 
+/**
+ * Compact ChatGPT/Codex subscription rate-limit window. Sourced from Codex
+ * `account/rateLimits/read` (`primary` ≈ 5h, `secondary` ≈ weekly).
+ * `resetsAt` is unix seconds when present.
+ */
+export const ServerProviderRateLimitWindow = Schema.Struct({
+  usedPercent: Schema.Number,
+  resetsAt: Schema.optional(Schema.Number),
+  windowDurationMins: Schema.optional(Schema.Number),
+});
+export type ServerProviderRateLimitWindow = typeof ServerProviderRateLimitWindow.Type;
+
+export const ServerProviderRateLimits = Schema.Struct({
+  primary: Schema.optional(ServerProviderRateLimitWindow),
+  secondary: Schema.optional(ServerProviderRateLimitWindow),
+});
+export type ServerProviderRateLimits = typeof ServerProviderRateLimits.Type;
+
 export const ServerProvider = Schema.Struct({
   // Routing key for the configured instance this snapshot represents. This
   // is the only stable identity consumers may use for provider routing.
@@ -229,6 +247,9 @@ export const ServerProvider = Schema.Struct({
   workspaceSnapshots: Schema.optionalKey(Schema.Array(ServerProviderWorkspaceSnapshot)),
   versionAdvisory: Schema.optionalKey(ServerProviderVersionAdvisory),
   updateState: Schema.optionalKey(ServerProviderUpdateState),
+  // ChatGPT/Codex remaining subscription windows. Omitted when the provider
+  // does not report limits (API-key auth, old CLI, probe failure).
+  rateLimits: Schema.optionalKey(ServerProviderRateLimits),
 });
 export type ServerProvider = typeof ServerProvider.Type;
 

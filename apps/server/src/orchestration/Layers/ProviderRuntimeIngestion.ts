@@ -1482,6 +1482,20 @@ const make = Effect.gen(function* () {
 
       const thread = yield* resolveThreadRuntimeContext(event.threadId);
       if (!thread) return;
+      const projectedProviderInstanceId = thread.session?.providerInstanceId;
+      if (
+        projectedProviderInstanceId !== undefined &&
+        event.providerInstanceId !== undefined &&
+        projectedProviderInstanceId !== event.providerInstanceId
+      ) {
+        yield* Effect.logDebug("provider runtime ingestion ignored event from stale owner", {
+          threadId: event.threadId,
+          eventType: event.type,
+          eventProviderInstanceId: event.providerInstanceId,
+          projectedProviderInstanceId,
+        });
+        return;
+      }
 
       const now = event.createdAt;
       const eventTurnId = toTurnId(event.turnId);

@@ -31,9 +31,11 @@ import {
   ThreadId,
   ProviderSendTurnInput,
 } from "@t3tools/contracts";
-import * as Effect from "effect/Effect";
 import * as NodeCrypto from "node:crypto";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -101,7 +103,9 @@ interface CodexAdapterSessionContext {
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
   readonly turnTokenUsage: CodexTurnTokenUsageState;
+  routable: boolean;
   stopped: boolean;
+  stopResult: Deferred.Deferred<void, ProviderAdapterError> | undefined;
 }
 
 type CodexCumulativeTokenUsage = {
@@ -2229,6 +2233,40 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
 
+  const writeNativeEvent = Effect.fnUntraced(function* (event: ProviderEvent) {
+    if (!nativeEventLogger) {
+      return;
+    }
+    yield* nativeEventLogger.write(event, event.threadId);
+  });
+
+  const releaseSessionResources = Effect.fn("releaseSessionResources")(function* (
+    threadId: ThreadId,
+    runtime: CodexSessionRuntimeShape,
+    scope: Scope.Closeable,
+    eventFiber: Fiber.Fiber<void, never>,
+  ) {
+    const cleanupExit = yield* Effect.exit(
+      runtime.close.pipe(
+        Effect.ensuring(Scope.close(scope, Exit.void)),
+        Effect.ensuring(Fiber.interrupt(eventFiber)),
+        Effect.uninterruptible,
+      ),
+    );
+    if (Exit.isFailure(cleanupExit)) {
+      const cause = Cause.squash(cleanupExit.cause);
+      return yield* new ProviderAdapterProcessError({
+        provider: PROVIDER,
+        threadId,
+        detail: "Failed to release Codex session resources.",
+        cause,
+      });
+    }
+    const closedEvent = cleanupExit.value;
+    yield* writeNativeEvent(closedEvent);
+    yield* Queue.offerAll(runtimeEventQueue, mapToRuntimeEvents(closedEvent, threadId));
+  });
+
   const startSession: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -2237,6 +2275,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             provider: PROVIDER,
             operation: "startSession",
             issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
+          });
+        }
+        if (input.resumeCursor !== undefined && !isCodexResumeCursorSchema(input.resumeCursor)) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "Invalid Codex resume cursor.",
           });
         }
 
@@ -2381,7 +2426,18 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           }),
         ).pipe(Effect.forkIn(sessionScope));
 
-        const started = yield* runtime.start().pipe(
+        const sessionContext: CodexAdapterSessionContext = {
+          threadId: input.threadId,
+          scope: sessionScope,
+          runtime,
+          eventFiber,
+          turnTokenUsage,
+          routable: false,
+          stopped: false,
+          stopResult: undefined,
+        };
+
+        const startedExit = yield* runtime.start().pipe(
           Effect.mapError(
             (cause) =>
               new ProviderAdapterProcessError({
@@ -2391,23 +2447,26 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 cause,
               }),
           ),
-          Effect.onError(() =>
-            runtime.close.pipe(
-              Effect.andThen(Effect.ignore(Scope.close(sessionScope, Exit.void))),
-              Effect.andThen(Fiber.interrupt(eventFiber)),
-              Effect.ignore,
-            ),
-          ),
+          Effect.exit,
         );
+        if (Exit.isFailure(startedExit)) {
+          const releaseExit = yield* releaseSessionResources(
+            input.threadId,
+            runtime,
+            sessionScope,
+            eventFiber,
+          ).pipe(Effect.exit);
+          if (Exit.isFailure(releaseExit)) {
+            sessions.set(input.threadId, sessionContext);
+            sessionScopeTransferred = true;
+            return yield* Effect.failCause(releaseExit.cause);
+          }
+          return yield* Effect.failCause(startedExit.cause);
+        }
+        const started = startedExit.value;
 
-        sessions.set(input.threadId, {
-          threadId: input.threadId,
-          scope: sessionScope,
-          runtime,
-          eventFiber,
-          turnTokenUsage,
-          stopped: false,
-        });
+        sessionContext.routable = true;
+        sessions.set(input.threadId, sessionContext);
         sessionScopeTransferred = true;
 
         return started;
@@ -2485,7 +2544,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
   const requireSession = Effect.fn("requireSession")(function* (threadId: ThreadId) {
     const session = sessions.get(threadId);
-    if (!session || session.stopped) {
+    if (!session || session.stopped || !session.routable) {
       return yield* new ProviderAdapterSessionNotFoundError({
         provider: PROVIDER,
         threadId,
@@ -2595,25 +2654,42 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       ),
     );
 
-  const writeNativeEvent = Effect.fnUntraced(function* (event: ProviderEvent) {
-    if (!nativeEventLogger) {
-      return;
-    }
-    yield* nativeEventLogger.write(event, event.threadId);
-  });
+  const stopSessionInternal = Effect.fn("stopSessionInternal")(
+    (session: CodexAdapterSessionContext) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const candidate = yield* Deferred.make<void, ProviderAdapterError>();
+          if (session.stopped) {
+            return;
+          }
+          if (session.stopResult !== undefined) {
+            return yield* restore(Deferred.await(session.stopResult));
+          }
 
-  const stopSessionInternal = Effect.fn("stopSessionInternal")(function* (
-    session: CodexAdapterSessionContext,
-  ) {
-    if (session.stopped) {
-      return;
-    }
-    session.stopped = true;
-    sessions.delete(session.threadId);
-    yield* session.runtime.close.pipe(Effect.ignore);
-    yield* Effect.ignore(Scope.close(session.scope, Exit.void));
-    yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
-  });
+          session.stopResult = candidate;
+          session.routable = false;
+          const stopExit = yield* Effect.exit(
+            Effect.gen(function* () {
+              yield* releaseSessionResources(
+                session.threadId,
+                session.runtime,
+                session.scope,
+                session.eventFiber,
+              );
+              session.stopped = true;
+              if (sessions.get(session.threadId) === session) {
+                sessions.delete(session.threadId);
+              }
+            }),
+          );
+          yield* Deferred.done(candidate, stopExit);
+          if (Exit.isFailure(stopExit)) {
+            session.stopResult = undefined;
+            return yield* Effect.failCause(stopExit.cause);
+          }
+        }),
+      ),
+  );
 
   const stopSession: CodexAdapterShape["stopSession"] = (threadId) =>
     Effect.gen(function* () {
@@ -2626,7 +2702,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
   const listSessions: CodexAdapterShape["listSessions"] = () =>
     Effect.forEach(
-      Array.from(sessions.values()).filter((session) => !session.stopped),
+      Array.from(sessions.values()).filter((session) => !session.stopped && session.routable),
       (session) => session.runtime.getSession,
       { concurrency: 1 },
     );
@@ -2642,8 +2718,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
   yield* Effect.acquireRelease(Effect.void, () =>
     stopAll().pipe(
-      Effect.andThen(Queue.shutdown(runtimeEventQueue)),
-      Effect.andThen(managedNativeEventLogger?.close() ?? Effect.void),
+      Effect.ensuring(
+        Queue.shutdown(runtimeEventQueue).pipe(
+          Effect.ensuring(managedNativeEventLogger?.close() ?? Effect.void),
+        ),
+      ),
       Effect.ignore,
     ),
   );

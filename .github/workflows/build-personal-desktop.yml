@@ -1,0 +1,164 @@
+name: Build personal desktop artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - t3code/private-localhost-port-forward
+    paths:
+      - .github/workflows/build-personal-desktop.yml
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Build fork JS bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.config.outputs.version }}
+      clerk_publishable_key: ${{ steps.config.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ steps.config.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ steps.config.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ steps.config.outputs.relay_url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - name: Install bundle dependencies
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+      - name: Set fork version and public Connect configuration
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_version="$(node -p "require('./apps/desktop/package.json').version")"
+          version="${base_version}-preview.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}"
+          node scripts/update-release-package-versions.ts "$version"
+          cp .env.example .env
+          source .env.example
+          {
+            echo "version=$version"
+            echo "clerk_publishable_key=$T3CODE_CLERK_PUBLISHABLE_KEY"
+            echo "clerk_jwt_template=$T3CODE_CLERK_JWT_TEMPLATE"
+            echo "clerk_cli_oauth_client_id=$T3CODE_CLERK_CLI_OAUTH_CLIENT_ID"
+            echo "relay_url=$T3CODE_RELAY_URL"
+          } >> "$GITHUB_OUTPUT"
+      - name: Install browser secret helper build libraries
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+      - name: Build shared desktop, server, and web bundles
+        run: vp run build:desktop
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Ubuntu Intel x64
+    needs: bundle
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      version: ${{ needs.bundle.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: preview
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ needs.bundle.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ needs.bundle.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ needs.bundle.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ needs.bundle.outputs.relay_url }}
+      label: Ubuntu x64
+      runner: ubuntu-24.04
+      platform: linux
+      target: AppImage
+      arch: x64
+      rust_target: x86_64-unknown-linux-gnu
+      resource_key: linux-x64
+      cli_archive: true
+
+  mac:
+    name: MacBook M2 arm64
+    needs: bundle
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      version: ${{ needs.bundle.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: preview
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ needs.bundle.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ needs.bundle.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ needs.bundle.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ needs.bundle.outputs.relay_url }}
+      label: macOS Apple Silicon
+      runner: macos-15
+      platform: mac
+      target: dmg
+      arch: arm64
+      rust_target: aarch64-apple-darwin
+      resource_key: darwin-arm64
+
+  windows:
+    name: Windows Intel x64
+    needs: [bundle, linux]
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      version: ${{ needs.bundle.outputs.version }}
+      ref: ${{ github.sha }}
+      release_channel: preview
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ needs.bundle.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ needs.bundle.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ needs.bundle.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ needs.bundle.outputs.relay_url }}
+      label: Windows x64
+      runner: windows-2025
+      platform: win
+      target: nsis
+      arch: x64
+      rust_target: x86_64-pc-windows-msvc
+      resource_key: win32-x64
+
+  verify:
+    name: Record build identity and checksums
+    needs: [bundle, linux, mac, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: installers
+      - name: Verify all requested installers and record their identity
+        shell: bash
+        env:
+          BUILD_VERSION: ${{ needs.bundle.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd installers
+          test -s "T3-Code-${BUILD_VERSION}-x64.deb"
+          test -s "T3-Code-${BUILD_VERSION}-x64.AppImage"
+          test -s "T3-Code-${BUILD_VERSION}-arm64.dmg"
+          test -s "T3-Code-${BUILD_VERSION}-x64.exe"
+          sha256sum *.deb *.AppImage *.dmg *.zip *.exe > SHA256SUMS
+          printf 'Version: %s\nCommit: %s\nBase: T3 Code v0.0.44\nConnect relay: %s\n' \
+            "$BUILD_VERSION" "$GITHUB_SHA" '${{ needs.bundle.outputs.relay_url }}' > BUILD.txt
+          cat BUILD.txt SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: build-checksums
+          path: |
+            installers/BUILD.txt
+            installers/SHA256SUMS
+          if-no-files-found: error

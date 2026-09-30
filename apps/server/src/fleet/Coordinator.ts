@@ -17,6 +17,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -38,11 +39,19 @@ const decodeInstalled = Schema.decodeUnknownEffect(
 const decodeDevice = Schema.decodeUnknownEffect(FleetDevice);
 const decodeResult = Schema.decodeUnknownEffect(Schema.fromJsonString(FleetResult));
 const capability = (action: FleetAction): FleetCapability =>
-  action.kind === "capture" || action.kind === "receive" ? "transfer" : action.kind;
+  action.kind === "capture" || action.kind === "receive" || action.kind === "remove-source"
+    ? "transfer"
+    : action.kind === "exec"
+      ? "run"
+      : action.kind === "search" || action.kind === "stat"
+        ? "read"
+        : action.kind;
 
 export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const now = Clock.currentTimeMillis;
+  const changes = yield* PubSub.sliding<void>(1);
+  const changed = PubSub.publish(changes, undefined);
   const save = (job: FleetJob) =>
     sql`UPDATE fleet_jobs SET status=${job.status}, payload=${JSON.stringify(job)} WHERE id=${job.id}`;
   const jobById = (id: string) =>
@@ -112,19 +121,41 @@ export const make = Effect.gen(function* () {
           const action = request.action;
           if (action.kind === "run" && !metadata.tasks[action.task])
             return yield* fail("Device has no approved task with that name.");
+          if (action.kind === "exec" && (!metadata.execution || metadata.execution === "disabled"))
+            return yield* fail(
+              "Commands are disabled on this device. The owner must enable execution in its worker configuration.",
+            );
           if (action.kind === "deploy" && !metadata.applications[action.application])
             return yield* fail("Device has no deployment recipe for that application.");
           if (
-            (action.kind === "read" || action.kind === "capture") &&
+            (action.kind === "read" ||
+              action.kind === "capture" ||
+              action.kind === "search" ||
+              action.kind === "stat") &&
+            action.root !== undefined &&
             !metadata.readRoots.includes(action.root)
           )
             return yield* fail("Device has no approved read root with that name.");
-          if (action.kind === "receive" && !metadata.writeRoots.includes(action.root))
+          if (
+            (action.kind === "receive" ||
+              action.kind === "write" ||
+              action.kind === "remove-source") &&
+            action.root !== undefined &&
+            !metadata.writeRoots.includes(action.root)
+          )
             return yield* fail("Device has no approved write root with that name.");
         }
         let needsApproval = false;
         if (request.action.kind === "run")
           needsApproval = metadata?.tasks[request.action.task] !== "always";
+        if (request.action.kind === "exec" && request.action.afterOperationId) {
+          const prerequisite = yield* jobById(request.action.afterOperationId);
+          if (prerequisite.threadId !== threadId)
+            return yield* fail("A command can depend only on this thread's own operation.");
+        }
+        if (request.action.kind === "exec")
+          needsApproval =
+            metadata?.execution !== "allow" || request.action.command.requiresElevation === true;
         if (request.action.kind === "deploy") {
           needsApproval = metadata?.applications[request.action.application] !== "always";
           const build = yield* artifact(request.action.sha256);
@@ -133,10 +164,22 @@ export const make = Effect.gen(function* () {
           if (metadata && (metadata.os !== build.os || metadata.arch !== build.arch))
             return yield* fail("Artifact OS or architecture does not match the device.");
         }
-        if (request.action.kind === "receive") {
+        if (request.action.kind === "receive" || request.action.kind === "remove-source") {
           const source = yield* jobById(request.action.sourceJobId);
           if (source.threadId !== threadId || source.action.kind !== "capture")
             return yield* fail("Transfer source must be this thread's file capture.");
+          if (request.action.kind === "remove-source") {
+            const destination = yield* jobById(request.action.destinationJobId);
+            if (
+              destination.threadId !== threadId ||
+              destination.action.kind !== "receive" ||
+              destination.action.sourceJobId !== source.id ||
+              request.device !== source.device ||
+              request.action.path !== source.action.path ||
+              request.action.root !== source.action.root
+            )
+              return yield* fail("A move can remove only its own captured source after delivery.");
+          }
         }
         const job: FleetJob = {
           id: NodeCrypto.randomUUID(),
@@ -189,9 +232,19 @@ export const make = Effect.gen(function* () {
       )
         return yield* fail("Invalid or expired Fleet execution lease.");
       yield* requireGrant(job.threadId, job.device, job.action);
-      if (job.action.kind === "receive") {
+      if (job.action.kind === "receive" || job.action.kind === "remove-source") {
         const source = yield* jobById(job.action.sourceJobId);
         yield* requireGrant(source.threadId, source.device, source.action);
+        if (job.action.kind === "remove-source") {
+          const destination = yield* jobById(job.action.destinationJobId);
+          yield* requireGrant(destination.threadId, destination.device, destination.action);
+          if (
+            destination.status !== "succeeded" ||
+            !source.capturedArtifact ||
+            destination.result?.artifact !== source.capturedArtifact.sha256
+          )
+            return yield* fail("Source removal requires a verified successful delivery.");
+        }
       }
       return job;
     });
@@ -203,6 +256,52 @@ export const make = Effect.gen(function* () {
       }>`SELECT payload FROM fleet_jobs WHERE status IN ('queued','awaiting-approval','running')`;
       for (const row of rows) {
         const job = yield* decodeJob(row.payload);
+        if (job.status !== "running" && job.action.kind === "exec" && job.action.afterOperationId) {
+          const prerequisite = yield* jobById(job.action.afterOperationId);
+          if (["failed", "cancelled", "uncertain"].includes(prerequisite.status)) {
+            yield* save({
+              ...job,
+              status: "cancelled",
+              result: {
+                status: "failed",
+                stdout: "",
+                stderr: "The prerequisite did not succeed; command was not run.",
+                exitCode: null,
+                truncated: false,
+              },
+            });
+            continue;
+          }
+        }
+        if (
+          job.status === "queued" &&
+          (job.action.kind === "receive" || job.action.kind === "remove-source")
+        ) {
+          const source = yield* jobById(job.action.sourceJobId);
+          const destination =
+            job.action.kind === "remove-source"
+              ? yield* jobById(job.action.destinationJobId)
+              : null;
+          if (
+            [source, destination].some(
+              (dependency) =>
+                dependency && ["failed", "cancelled", "uncertain"].includes(dependency.status),
+            )
+          ) {
+            yield* save({
+              ...job,
+              status: "cancelled",
+              result: {
+                status: "failed",
+                stdout: "",
+                stderr: "Transfer prerequisite did not succeed; the source has been retained.",
+                exitCode: null,
+                truncated: false,
+              },
+            });
+            continue;
+          }
+        }
         if (job.status === "running" && (job.leaseExpiresAt ?? 0) <= time)
           yield* save({ ...job, status: "uncertain" });
         else if (
@@ -258,7 +357,10 @@ export const make = Effect.gen(function* () {
             }
           }),
         )
-        .pipe(Effect.mapError(fleetError)),
+        .pipe(
+          Effect.tap(() => changed),
+          Effect.mapError(fleetError),
+        ),
     devices: (threadId?: string) =>
       Effect.gen(function* () {
         const time = yield* now;
@@ -306,22 +408,49 @@ export const make = Effect.gen(function* () {
       sql
         .withTransaction(
           Effect.gen(function* () {
+            if (
+              input.move &&
+              input.from === input.to &&
+              input.fromRoot === input.toRoot &&
+              input.fromPath === input.toPath
+            )
+              return yield* fail("A move needs a different destination file.");
             const source = yield* enqueue(threadId, {
               requestId: `${input.requestId}.source`,
               device: input.from,
-              action: { kind: "capture", root: input.fromRoot, path: input.fromPath },
+              action: {
+                kind: "capture",
+                ...(input.fromRoot ? { root: input.fromRoot } : {}),
+                path: input.fromPath,
+                ...(input.move ? { move: true } : {}),
+                ...(input.expectedSha256 ? { expectedSha256: input.expectedSha256 } : {}),
+              },
             });
             const destination = yield* enqueue(threadId, {
               requestId: `${input.requestId}.target`,
               device: input.to,
               action: {
                 kind: "receive",
-                root: input.toRoot,
+                ...(input.toRoot ? { root: input.toRoot } : {}),
                 path: input.toPath,
                 sourceJobId: source.id,
+                ...(input.overwrite ? { overwrite: true } : {}),
               },
             });
-            return { source, destination };
+            const cleanup = input.move
+              ? yield* enqueue(threadId, {
+                  requestId: `${input.requestId}.cleanup`,
+                  device: input.from,
+                  action: {
+                    kind: "remove-source",
+                    ...(input.fromRoot ? { root: input.fromRoot } : {}),
+                    path: input.fromPath,
+                    sourceJobId: source.id,
+                    destinationJobId: destination.id,
+                  },
+                })
+              : undefined;
+            return { source, destination, ...(cleanup ? { cleanup } : {}) };
           }),
         )
         .pipe(Effect.mapError(fleetError)),
@@ -377,7 +506,10 @@ export const make = Effect.gen(function* () {
             yield* save({ ...job, status: "cancelled" });
           }),
         )
-        .pipe(Effect.mapError(fleetError)),
+        .pipe(
+          Effect.tap(() => changed),
+          Effect.mapError(fleetError),
+        ),
     poll: (sessionId: string, metadata: FleetMetadata) =>
       sql
         .withTransaction(
@@ -405,8 +537,26 @@ export const make = Effect.gen(function* () {
                 yield* save({ ...job, status: "cancelled" });
                 continue;
               }
+              if (job.action.kind === "exec" && job.action.afterOperationId) {
+                const prerequisite = yield* jobById(job.action.afterOperationId);
+                if (["failed", "cancelled", "uncertain"].includes(prerequisite.status)) {
+                  yield* save({
+                    ...job,
+                    status: "cancelled",
+                    result: {
+                      status: "failed",
+                      stdout: "",
+                      stderr: "The prerequisite did not succeed; command was not run.",
+                      exitCode: null,
+                      truncated: false,
+                    },
+                  });
+                  continue;
+                }
+                if (prerequisite.status !== "succeeded") continue;
+              }
               let build: FleetArtifact | null = null;
-              if (job.action.kind === "receive") {
+              if (job.action.kind === "receive" || job.action.kind === "remove-source") {
                 const source = yield* jobById(job.action.sourceJobId);
                 if (["failed", "cancelled", "uncertain"].includes(source.status)) {
                   yield* save({ ...job, status: "cancelled" });
@@ -419,6 +569,44 @@ export const make = Effect.gen(function* () {
                   continue;
                 }
               }
+              if (job.action.kind === "remove-source") {
+                const destination = yield* jobById(job.action.destinationJobId);
+                if (["failed", "cancelled", "uncertain"].includes(destination.status)) {
+                  yield* save({ ...job, status: "cancelled" });
+                  continue;
+                }
+                if (destination.status !== "succeeded") continue;
+                const source = yield* jobById(job.action.sourceJobId);
+                const normalize = (value: string) =>
+                  metadata.os === "windows" ? value.replaceAll("\\", "/").toLowerCase() : value;
+                if (
+                  source.device === destination.device &&
+                  source.result?.file &&
+                  destination.result?.file &&
+                  normalize(source.result.file.path) === normalize(destination.result.file.path)
+                ) {
+                  yield* save({
+                    ...job,
+                    status: "failed",
+                    result: {
+                      status: "failed",
+                      stdout: "",
+                      stderr: "Source and destination are the same file; source retained.",
+                      exitCode: null,
+                      truncated: false,
+                    },
+                  });
+                  continue;
+                }
+                if (
+                  !build ||
+                  destination.result?.artifact !== build.sha256 ||
+                  !(yield* authorized(destination.threadId, destination.device, destination.action))
+                ) {
+                  yield* save({ ...job, status: "cancelled" });
+                  continue;
+                }
+              }
               if (job.action.kind === "deploy") {
                 build = yield* artifact(job.action.sha256);
                 if (!build || metadata.os !== build.os || metadata.arch !== build.arch) {
@@ -427,11 +615,17 @@ export const make = Effect.gen(function* () {
                 }
               }
               const approval =
-                job.action.kind === "run"
-                  ? metadata.tasks[job.action.task]
-                  : job.action.kind === "deploy"
-                    ? metadata.applications[job.action.application]
-                    : "always";
+                job.action.kind === "exec"
+                  ? metadata.execution === "allow" && !job.action.command.requiresElevation
+                    ? "always"
+                    : metadata.execution === "ask" || metadata.execution === "allow"
+                      ? "once"
+                      : undefined
+                  : job.action.kind === "run"
+                    ? metadata.tasks[job.action.task]
+                    : job.action.kind === "deploy"
+                      ? metadata.applications[job.action.application]
+                      : "always";
               if (approval === undefined) {
                 yield* save({
                   ...job,
@@ -439,7 +633,7 @@ export const make = Effect.gen(function* () {
                   result: {
                     status: "failed",
                     stdout: "",
-                    stderr: "Device no longer has that task or application recipe.",
+                    stderr: "Device no longer allows that command, task, or application recipe.",
                     exitCode: null,
                     truncated: false,
                   },
@@ -477,7 +671,10 @@ export const make = Effect.gen(function* () {
             return selected;
           }),
         )
-        .pipe(Effect.mapError(fleetError)),
+        .pipe(
+          Effect.tap((claim) => (claim ? changed : Effect.void)),
+          Effect.mapError(fleetError),
+        ),
     renew: (sessionId: string, id: string, lease: string) =>
       sql
         .withTransaction(
@@ -519,6 +716,14 @@ export const make = Effect.gen(function* () {
             )
               return yield* fail("Capture receipt does not match this job's uploaded bytes.");
             if (
+              result.status === "succeeded" &&
+              (job.action.kind === "receive" || job.action.kind === "remove-source")
+            ) {
+              const source = yield* jobById(job.action.sourceJobId);
+              if (!source.capturedArtifact || result.artifact !== source.capturedArtifact.sha256)
+                return yield* fail("Delivery receipt does not match the captured source hash.");
+            }
+            if (
               job.action.kind === "deploy" &&
               (result.status === "succeeded" || result.installedVersion !== undefined)
             ) {
@@ -540,7 +745,10 @@ export const make = Effect.gen(function* () {
             return updated;
           }),
         )
-        .pipe(Effect.mapError(fleetError)),
+        .pipe(
+          Effect.tap(() => changed),
+          Effect.mapError(fleetError),
+        ),
     checkLease: (sessionId: string, id: string, lease: string) =>
       checkLease(sessionId, id, lease).pipe(Effect.mapError(fleetError)),
     captured: (sessionId: string, id: string, lease: string, build: FleetArtifact) =>
@@ -559,6 +767,30 @@ export const make = Effect.gen(function* () {
         .pipe(Effect.mapError(fleetError)),
     artifact: (hash: string) => artifact(hash).pipe(Effect.mapError(fleetError)),
     job: (id: string) => refresh.pipe(Effect.andThen(jobById(id)), Effect.mapError(fleetError)),
+    wait: (id: string) =>
+      Effect.gen(function* () {
+        const subscription = yield* PubSub.subscribe(changes);
+        while (true) {
+          yield* refresh;
+          const job = yield* jobById(id);
+          if (!["queued", "running"].includes(job.status)) return job;
+          const devices = yield* sql<{
+            last_seen: number | null;
+          }>`SELECT last_seen FROM fleet_devices WHERE id=${job.device}`;
+          if (
+            job.status === "queued" &&
+            (devices[0]?.last_seen == null || (yield* now) - devices[0].last_seen >= LEASE_MS)
+          )
+            return job;
+          yield* PubSub.take(subscription);
+        }
+      }).pipe(
+        Effect.scoped,
+        Effect.timeoutOption("25 seconds"),
+        Effect.andThen(refresh),
+        Effect.andThen(jobById(id)),
+        Effect.mapError(fleetError),
+      ),
     registerArtifact: (build: FleetArtifact) =>
       registerArtifact(build).pipe(Effect.mapError(fleetError)),
     recover:

@@ -31,46 +31,8 @@ import {
 } from "./Coordinator.ts";
 const decodeArtifact = Schema.decodeUnknownEffect(FleetArtifact);
 
-/** Resolve real paths on both sides of the boundary; a symlink cannot turn an allowed folder into a new capability. */
-export const resolveRootPath = (
-  roots: Readonly<Record<string, string>>,
-  root: string,
-  relative: string,
-  writing = false,
-) =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
-    const directory = roots[root];
-    if (
-      !directory ||
-      !path.isAbsolute(directory) ||
-      path.isAbsolute(relative) ||
-      !relative ||
-      relative.includes("\0")
-    )
-      return yield* fail("Use a configured root and a relative file path.");
-    const base = yield* fs.realPath(directory);
-    const candidate = path.resolve(base, relative);
-    const inside = (value: string) => {
-      const rel = path.relative(base, value);
-      return (
-        rel !== "" && !rel.startsWith(`..${path.sep}`) && rel !== ".." && !path.isAbsolute(rel)
-      );
-    };
-    if (!inside(candidate)) return yield* fail("File escapes its approved root.");
-    if (writing) {
-      const parent = yield* fs.realPath(path.dirname(candidate));
-      if (parent !== base && !inside(parent))
-        return yield* fail("Destination folder escapes its approved root.");
-      return path.join(parent, path.basename(candidate));
-    }
-    const real = yield* fs.realPath(candidate);
-    if (!inside(real)) return yield* fail("File symlink escapes its approved root.");
-    if ((yield* fs.stat(real)).type !== "File")
-      return yield* fail("Fleet transfers regular files only.");
-    return real;
-  }).pipe(Effect.mapError(fleetError));
+export { resolveRootPath } from "./Files.ts";
+import { resolveRootPath, hashFile, searchFiles, writeFile } from "./Files.ts";
 
 const canonical = (value: unknown): unknown =>
   Array.isArray(value)
@@ -120,6 +82,8 @@ export const workerMetadata = (
   ),
   readRoots: Object.keys(config.readRoots),
   writeRoots: Object.keys(config.writeRoots),
+  execution: config.execution ?? "disabled",
+  paths: { read: config.readRoots, write: config.writeRoots },
 });
 
 export const makeTransport = (config: FleetWorkerConfig, token: string) => {
@@ -219,6 +183,52 @@ export const execute = (config: FleetWorkerConfig, claim: FleetClaim, transport:
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const action = claim.job.action;
+    if (action.kind === "exec") {
+      const approval = config.execution ?? "disabled";
+      if (approval === "disabled") return yield* fail("Commands are disabled on this device.");
+      if (
+        (approval === "ask" || action.command.requiresElevation) &&
+        (!claim.job.approved || claim.job.approvedPolicyHash !== workerPolicyHash(config))
+      )
+        return yield* fail("This command requires owner approval under the current device policy.");
+      return yield* command(action.command, claim);
+    }
+    if (action.kind === "search") {
+      const base = yield* resolveRootPath(config.readRoots, action.root, action.path, false, true);
+      return success(yield* searchFiles(base, action));
+    }
+    if (action.kind === "stat") {
+      const file = yield* resolveRootPath(config.readRoots, action.root, action.path);
+      return success({ file: yield* hashFile(file) });
+    }
+    if (action.kind === "write") {
+      if (Buffer.byteLength(action.content) > MAX_OUTPUT_BYTES)
+        return yield* fail("Write content exceeds 64 KiB; transfer larger files instead.");
+      const file = yield* resolveRootPath(config.writeRoots, action.root, action.path, true);
+      return success({
+        file: yield* writeFile(
+          file,
+          Buffer.from(action.content),
+          action.overwrite,
+          action.expectedSha256,
+        ),
+      });
+    }
+    if (action.kind === "remove-source") {
+      const expected = claim.artifact;
+      if (!expected) return yield* fail("Move has no verified source manifest.");
+      const file = yield* resolveRootPath(config.writeRoots, action.root, action.path);
+      const original = action.root
+        ? path.resolve(config.writeRoots[action.root]!, action.path)
+        : action.path;
+      if (Option.isSome(yield* fs.readLink(original).pipe(Effect.option)))
+        return yield* fail("Move source is a symlink; its target has been retained.");
+      const current = yield* hashFile(file);
+      if (current.sha256 !== expected.sha256 || current.size !== expected.size)
+        return yield* fail("Source changed after transfer; the source has been retained.");
+      yield* fs.remove(file);
+      return success({ artifact: current.sha256, file: current });
+    }
     if (action.kind === "run") {
       const task = config.tasks[action.task];
       if (
@@ -233,7 +243,16 @@ export const execute = (config: FleetWorkerConfig, claim: FleetClaim, transport:
       const file = yield* resolveRootPath(config.readRoots, action.root, action.path);
       if ((yield* fs.stat(file)).size > BigInt(MAX_OUTPUT_BYTES))
         return yield* fail("File is too large for readFile; use transfer instead.");
-      return success({ stdout: yield* fs.readFileString(file) });
+      const bytes = yield* fs.readFile(file);
+      return success({
+        stdout: Buffer.from(bytes).toString("utf8"),
+        file: {
+          path: file,
+          type: "file",
+          size: bytes.byteLength,
+          sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+        },
+      });
     }
     if (action.kind === "capture") {
       const file = yield* resolveRootPath(config.readRoots, action.root, action.path);
@@ -260,7 +279,12 @@ export const execute = (config: FleetWorkerConfig, claim: FleetClaim, transport:
           const build = yield* decodeArtifact(result);
           if (build.sha256 !== hash.digest("hex") || build.size !== offset)
             return yield* fail("Uploaded bytes did not match the source file stream.");
-          return success({ artifact: build.sha256 });
+          if (action.expectedSha256 && build.sha256 !== action.expectedSha256)
+            return yield* fail("Source does not match the requested SHA-256; transfer stopped.");
+          return success({
+            artifact: build.sha256,
+            file: { path: file, type: "file", size: offset, sha256: build.sha256 },
+          });
         }
         hash.update(bytes);
         offset += bytes.byteLength;
@@ -275,9 +299,12 @@ export const execute = (config: FleetWorkerConfig, claim: FleetClaim, transport:
       });
       yield* Stream.run(fs.stream(source), fs.sink(temporary));
       yield* fs.chmod(temporary, 0o600);
-      // Linking is atomic and refuses existing destinations, including symlinks.
-      yield* fs.link(temporary, destination);
-      return success({ artifact: claim.artifact!.sha256 });
+      if (action.overwrite) yield* fs.rename(temporary, destination);
+      else yield* fs.link(temporary, destination);
+      const received = yield* hashFile(destination);
+      if (received.sha256 !== claim.artifact!.sha256)
+        return yield* fail("Destination verification failed; the source has been retained.");
+      return success({ artifact: received.sha256, file: received });
     }
     const recipe = config.applications[action.application];
     const build = claim.artifact;

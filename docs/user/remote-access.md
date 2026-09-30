@@ -32,8 +32,8 @@ disconnect an otherwise healthy conversation.
 
 ## Private localhost forwarding
 
-For agent actions, file transfers, and exact build deployments between your
-environments, see [Fleet](./fleet.md).
+For agent access to files and commands on your other devices, see
+[Fleet](./fleet.md).
 
 Use private forwarding to open a host's local web servers from another machine
 through its existing T3 Connect address. Run a build with forwarding support on

@@ -43,6 +43,168 @@ const enqueue = (action: FleetAction, requestId = "request-1") =>
   );
 
 describe("Fleet durable coordinator", () => {
+  it.effect(
+    "keeps dependent commands behind verified results and cancels them if their prerequisite fails",
+    () =>
+      Effect.gen(function* () {
+        const coordinator = yield* setup;
+        const enabled = { ...metadata, execution: "allow" as const };
+        yield* coordinator.poll("credential-linux", enabled);
+        yield* coordinator.enroll("macbook", "credential-mac");
+        yield* coordinator.grant("thread-one", "macbook", ["run"], 10_000_000);
+        const mac = { ...enabled, environmentId: "environment-mac", os: "darwin" as const };
+        yield* coordinator.poll("credential-mac", mac);
+        const command = {
+          executable: "/bin/sh",
+          args: ["-c", "echo installed"],
+          cwd: "/Users/me",
+          timeoutSeconds: 30,
+        };
+        for (const failed of [false, true]) {
+          const prerequisite = yield* enqueue(
+            { kind: "read", path: "/home/me/build-id" },
+            `prepare-${failed}`,
+          );
+          const dependent = yield* coordinator.enqueue("thread-one", {
+            device: "macbook",
+            requestId: `install-${failed}`,
+            action: { kind: "exec", command, afterOperationId: prerequisite.id },
+          });
+          assert.equal(dependent.status, "queued");
+          assert.equal(yield* coordinator.poll("credential-mac", mac), null);
+          const source = yield* coordinator.poll("credential-linux", enabled);
+          assert(source);
+          yield* coordinator.receipt("credential-linux", {
+            jobId: source.job.id,
+            lease: source.job.lease!,
+            result: failed ? { ...ok, status: "failed" } : ok,
+          });
+          if (failed) {
+            yield* TestClock.adjust(LEASE_MS + 1);
+            assert.equal((yield* coordinator.job(dependent.id)).status, "cancelled");
+            assert.equal(yield* coordinator.poll("credential-mac", mac), null);
+          } else {
+            const target = yield* coordinator.poll("credential-mac", mac);
+            assert.equal(target?.job.id, dependent.id);
+            yield* coordinator.receipt("credential-mac", {
+              jobId: target!.job.id,
+              lease: target!.job.lease!,
+              result: ok,
+            });
+          }
+        }
+        yield* coordinator.grant("other-thread", "linux-main", ["read"], 10_000_000);
+        const other = yield* coordinator.enqueue("other-thread", {
+          device: "linux-main",
+          requestId: "other",
+          action: { kind: "read", path: "/home/me/file" },
+        });
+        assert.equal(
+          (yield* coordinator
+            .enqueue("thread-one", {
+              device: "macbook",
+              requestId: "cross-thread",
+              action: { kind: "exec", command, afterOperationId: other.id },
+            })
+            .pipe(Effect.result))._tag,
+          "Failure",
+        );
+      }).pipe(Effect.provide(fixture)),
+  );
+
+  it.effect(
+    "requires explicit command permission and binds once approval to the exact command and policy",
+    () =>
+      Effect.gen(function* () {
+        const coordinator = yield* setup;
+        const command = {
+          executable: "powershell.exe",
+          args: ["-NoProfile", "-Command", "Write-Output 42"],
+          cwd: "C:\\Users\\me",
+          timeoutSeconds: 30,
+        };
+        const action = { kind: "exec" as const, command };
+        assert.equal((yield* enqueue(action).pipe(Effect.result))._tag, "Failure");
+        const asking = { ...metadata, execution: "ask" as const };
+        yield* coordinator.poll("credential-linux", asking);
+        const job = yield* enqueue(action);
+        assert.equal(job.status, "awaiting-approval");
+        assert.equal(
+          (yield* enqueue({ ...action, command: { ...command, args: ["changed"] } }).pipe(
+            Effect.result,
+          ))._tag,
+          "Failure",
+        );
+        yield* coordinator.approve(job.id, true);
+        assert.equal(
+          yield* coordinator.poll("credential-linux", { ...asking, policyHash: "2".repeat(64) }),
+          null,
+        );
+        assert.equal((yield* coordinator.job(job.id)).status, "awaiting-approval");
+        yield* coordinator.approve(job.id, true);
+        const claim = yield* coordinator.poll("credential-linux", {
+          ...asking,
+          policyHash: "2".repeat(64),
+        });
+        assert.equal(claim?.job.id, job.id);
+        yield* coordinator.receipt("credential-linux", {
+          jobId: job.id,
+          lease: claim!.job.lease!,
+          result: ok,
+        });
+        const allowed = { ...metadata, execution: "allow" as const };
+        yield* coordinator.poll("credential-linux", allowed);
+        assert.equal((yield* enqueue(action, "allowed")).status, "queued");
+        assert.equal(
+          (yield* enqueue(
+            { kind: "exec", command: { ...command, requiresElevation: true } },
+            "elevated",
+          )).status,
+          "awaiting-approval",
+        );
+      }).pipe(Effect.provide(fixture)),
+  );
+  it.effect(
+    "cancels dependent transfers even while their targets are offline and refuses same-file moves",
+    () =>
+      Effect.gen(function* () {
+        const coordinator = yield* setup;
+        yield* coordinator.enroll("macbook", "mac-token");
+        yield* coordinator.grant("thread-one", "macbook", ["transfer"], 10_000_000);
+        const jobs = yield* coordinator.transfer("thread-one", {
+          requestId: "move",
+          from: "linux-main",
+          fromPath: "/home/me/file",
+          to: "macbook",
+          toPath: "/Users/me/file",
+          move: true,
+        });
+        const claim = yield* coordinator.poll("credential-linux", metadata);
+        assert(claim);
+        yield* coordinator.receipt("credential-linux", {
+          jobId: claim.job.id,
+          lease: claim.job.lease!,
+          result: { ...ok, status: "failed", stderr: "file missing" },
+        });
+        assert.equal((yield* coordinator.job(jobs.destination.id)).status, "cancelled");
+        assert.equal((yield* coordinator.job(jobs.cleanup!.id)).status, "cancelled");
+        assert.equal(
+          (yield* coordinator
+            .transfer("thread-one", {
+              requestId: "same-file",
+              from: "linux-main",
+              fromPath: "/home/me/file",
+              to: "linux-main",
+              toPath: "/home/me/file",
+              move: true,
+              overwrite: true,
+            })
+            .pipe(Effect.result))._tag,
+          "Failure",
+        );
+      }).pipe(Effect.provide(fixture)),
+  );
+
   it.effect("keeps devices invisible and actions denied without an explicit thread grant", () =>
     Effect.gen(function* () {
       const coordinator = yield* setup;

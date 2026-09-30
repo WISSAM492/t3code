@@ -156,6 +156,16 @@ describe("t3 fleet owner commands", () => {
           );
           assert.equal(yield* fs.readFileString(target), installed);
         }
+        const { tasks: _tasks, applications: _applications, ...deviceConfig } = config;
+        yield* fs.writeFileString(
+          configFile,
+          JSON.stringify({ ...deviceConfig, execution: "allow" }),
+        );
+        yield* runCli(["join", "--config", configFile, ...location]);
+        const minimal = JSON.parse(yield* fs.readFileString(target));
+        assert.equal(minimal.execution, "allow");
+        assert.deepEqual(minimal.tasks, {});
+        assert.deepEqual(minimal.applications, {});
         yield* runCli(["leave", ...location]);
         assert.equal(yield* fs.exists(target), false);
       }),

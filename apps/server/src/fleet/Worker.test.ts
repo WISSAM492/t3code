@@ -8,6 +8,9 @@ import {
   AuthStandardClientScopes,
   FleetJob,
   type FleetWorkerConfig,
+  EnvironmentId,
+  ProviderInstanceId,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -24,6 +27,8 @@ import { layer as processLayer } from "../processRunner.ts";
 import { blobPath, publishArtifact } from "./Artifacts.ts";
 import { Coordinator, layer as coordinatorLayer, MAX_OUTPUT_BYTES } from "./Coordinator.ts";
 import { routes } from "./http.ts";
+import { McpInvocationContext } from "../mcp/McpInvocationContext.ts";
+import { make as makeTools } from "../mcp/toolkits/fleet/handlers.ts";
 import {
   execute,
   makeTransport,
@@ -63,7 +68,7 @@ const setup = Effect.gen(function* () {
   yield* coordinator.grant(
     "thread-one",
     "linux-main",
-    ["run", "read", "transfer", "deploy"],
+    ["run", "read", "write", "transfer", "deploy"],
     Date.now() + 86400_000,
   );
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "fleet-root-" });
@@ -99,7 +104,290 @@ const setup = Effect.gen(function* () {
 const run = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.scoped(effect).pipe(Effect.provide(fixture), TestClock.withLive);
 
+const invocation = {
+  environmentId: EnvironmentId.make("home"),
+  threadId: ThreadId.make("thread-one"),
+  providerInstanceId: ProviderInstanceId.make("codex"),
+  providerSessionId: "normal-codex-session",
+  capabilities: new Set<never>(),
+  issuedAt: 0,
+};
+
 describe("Fleet outbound worker and HTTP boundary", () => {
+  it.effect(
+    "stops an exact-build transfer when the source hash has changed, retaining the original",
+    () =>
+      run(
+        Effect.gen(function* () {
+          const { fs, root, coordinator, issued, worker, transport, workerMetadata } = yield* setup;
+          yield* fs.writeFileString(`${root}/build`, "newer build");
+          const jobs = yield* coordinator.transfer("thread-one", {
+            requestId: "exact-build",
+            from: "linux-main",
+            fromPath: `${root}/build`,
+            to: "linux-main",
+            toPath: `${root}/installed`,
+            expectedSha256: NodeCrypto.createHash("sha256").update("inspected build").digest("hex"),
+            move: true,
+          });
+          const capture = yield* coordinator.poll(
+            issued.sessionId,
+            workerMetadata(worker, "environment-linux"),
+          );
+          assert(capture);
+          const result = yield* runClaim(worker, capture, transport);
+          assert.notEqual(result.status, "succeeded");
+          yield* coordinator.receipt(issued.sessionId, {
+            jobId: capture.job.id,
+            lease: capture.job.lease!,
+            result,
+          });
+          assert.equal((yield* coordinator.job(jobs.destination.id)).status, "cancelled");
+          assert.equal((yield* coordinator.job(jobs.cleanup!.id)).status, "cancelled");
+          assert.equal(yield* fs.readFileString(`${root}/build`), "newer build");
+          assert.equal(yield* fs.exists(`${root}/installed`), false);
+        }),
+      ),
+  );
+
+  it.effect(
+    "returns an ad hoc command receipt directly to the normal agent without a named task",
+    () =>
+      run(
+        Effect.gen(function* () {
+          const { root, worker, coordinator, issued, saveConfig, workerMetadata } = yield* setup;
+          const configured = { ...worker, execution: "allow" as const };
+          yield* saveConfig(configured);
+          yield* coordinator.poll(
+            issued.sessionId,
+            workerMetadata(configured, "environment-linux"),
+          );
+          const command = {
+            executable: process.execPath,
+            args: ["-e", "console.log(JSON.stringify({answer:6*7,cwd:process.cwd()}))"],
+            cwd: root,
+            timeoutSeconds: 10,
+          };
+          const job = yield* coordinator.enqueue("thread-one", {
+            device: "linux-main",
+            requestId: "natural-command",
+            action: { kind: "exec", command },
+          });
+          const tools = yield* makeTools;
+          const [result] = yield* Effect.all(
+            [
+              tools.fleet_run({ device: "linux-main", requestId: "natural-command", command }),
+              runCycle(
+                "environment-linux",
+                yield* HostProcessPlatform,
+                yield* HostProcessArchitecture,
+              ),
+            ],
+            { concurrency: "unbounded" },
+          );
+          assert.equal(result.operationId, job.id);
+          assert.equal(result.status, "succeeded");
+          assert.equal(JSON.parse(result.result!.stdout).answer, 42);
+          assert.equal(JSON.parse(result.result!.stdout).cwd, root);
+          assert.deepEqual(yield* coordinator.pendingReceipts, []);
+        }).pipe(Effect.provideService(McpInvocationContext, invocation)),
+      ),
+  );
+
+  it.effect(
+    "finds a file by name, reads and compares its hash, and guards edits against stale contents",
+    () =>
+      run(
+        Effect.gen(function* () {
+          const { fs, root, coordinator, issued, worker, transport, workerMetadata } = yield* setup;
+          yield* fs.makeDirectory(`${root}/Downloads`);
+          yield* fs.writeFileString(`${root}/Downloads/report.txt`, "original report");
+          const outside = yield* fs.makeTempDirectoryScoped();
+          yield* fs.writeFileString(`${outside}/report-secret.txt`, "private");
+          yield* fs.symlink(outside, `${root}/escape`);
+          const perform = (
+            action: Parameters<typeof coordinator.enqueue>[1]["action"],
+            requestId: string,
+          ) =>
+            Effect.gen(function* () {
+              const job = yield* coordinator.enqueue("thread-one", {
+                device: "linux-main",
+                requestId,
+                action,
+              });
+              const claim = yield* coordinator.poll(
+                issued.sessionId,
+                workerMetadata(worker, "environment-linux"),
+              );
+              assert(claim);
+              const result = yield* runClaim(worker, claim, transport);
+              yield* coordinator.receipt(issued.sessionId, {
+                jobId: job.id,
+                lease: claim.job.lease!,
+                result,
+              });
+              yield* coordinator.forgetReceipt(job.id);
+              return result;
+            });
+          const search = yield* perform(
+            { kind: "search", path: root, query: "report", recursive: true },
+            "find-report",
+          );
+          assert.deepEqual(
+            search.files?.map((file) => file.path),
+            [`${root}/Downloads/report.txt`],
+          );
+          const read = yield* perform(
+            { kind: "read", path: search.files![0]!.path },
+            "read-report",
+          );
+          assert.equal(read.stdout, "original report");
+          const stat = yield* perform(
+            { kind: "stat", path: search.files![0]!.path },
+            "compare-report",
+          );
+          assert.equal(read.file?.sha256, stat.file?.sha256);
+          const written = yield* perform(
+            {
+              kind: "write",
+              path: search.files![0]!.path,
+              content: "updated report",
+              expectedSha256: read.file!.sha256!,
+            },
+            "edit-report",
+          );
+          assert.equal(written.status, "succeeded", written.stderr);
+          const stale = yield* perform(
+            {
+              kind: "write",
+              path: search.files![0]!.path,
+              content: "lost update",
+              expectedSha256: read.file!.sha256!,
+            },
+            "stale-edit",
+          );
+          assert.notEqual(stale.status, "succeeded");
+          assert.equal(yield* fs.readFileString(`${root}/Downloads/report.txt`), "updated report");
+          const collision = yield* perform(
+            { kind: "write", path: search.files![0]!.path, content: "replace" },
+            "collision",
+          );
+          assert.notEqual(collision.status, "succeeded");
+          const denied = yield* perform(
+            { kind: "read", path: `${outside}/report-secret.txt` },
+            "outside",
+          );
+          assert.notEqual(denied.status, "succeeded");
+          for (let index = 0; index < 4; index++)
+            yield* fs.writeFileString(`${root}/report-${index}`, "data");
+          const bounded = yield* perform(
+            { kind: "search", path: root, query: "report", recursive: true, limit: 2 },
+            "bounded-search",
+          );
+          assert.equal(bounded.files?.length, 2);
+          assert.equal(bounded.truncated, true);
+        }),
+      ),
+  );
+
+  it.effect(
+    "moves between enrolled devices only after verified delivery and retains a changed source",
+    () =>
+      run(
+        Effect.gen(function* () {
+          const { fs, root, coordinator, issued, worker, transport, auth, workerMetadata } =
+            yield* setup;
+          const targetRoot = yield* fs.makeTempDirectoryScoped();
+          const target = yield* auth.issueSession({ scopes: [AuthFleetDeviceScope] });
+          yield* coordinator.enroll("windows-main", target.sessionId);
+          yield* coordinator.grant(
+            "thread-one",
+            "windows-main",
+            ["transfer"],
+            Date.now() + 86400_000,
+          );
+          const targetWorker = {
+            ...worker,
+            tokenFile: `${targetRoot}/token`,
+            readRoots: { project: targetRoot },
+            writeRoots: { project: targetRoot },
+          };
+          const targetMetadata = workerMetadata(targetWorker, "environment-windows");
+          const targetTransport = makeTransport(targetWorker, target.token);
+          yield* coordinator.poll(target.sessionId, targetMetadata);
+          for (const changed of [false, true]) {
+            const sourcePath = `${root}/source-${changed}.txt`;
+            const destinationPath = `${targetRoot}/received-${changed}.txt`;
+            yield* fs.writeFileString(sourcePath, "exact bytes");
+            const jobs = yield* coordinator.transfer("thread-one", {
+              requestId: `move-${changed}`,
+              from: "linux-main",
+              fromPath: sourcePath,
+              to: "windows-main",
+              toPath: destinationPath,
+              move: true,
+            });
+            assert(jobs.cleanup);
+            assert.equal(yield* coordinator.poll(target.sessionId, targetMetadata), null);
+            const capture = yield* coordinator.poll(
+              issued.sessionId,
+              workerMetadata(worker, "environment-linux"),
+            );
+            assert(capture);
+            const captured = yield* Effect.scoped(execute(worker, capture, transport));
+            yield* coordinator.receipt(issued.sessionId, {
+              jobId: capture.job.id,
+              lease: capture.job.lease!,
+              result: captured,
+            });
+            assert.equal(
+              yield* coordinator.poll(
+                issued.sessionId,
+                workerMetadata(worker, "environment-linux"),
+              ),
+              null,
+            );
+            const receive = yield* coordinator.poll(target.sessionId, targetMetadata);
+            assert(receive);
+            const received = yield* Effect.scoped(execute(targetWorker, receive, targetTransport));
+            yield* coordinator.receipt(target.sessionId, {
+              jobId: receive.job.id,
+              lease: receive.job.lease!,
+              result: received,
+            });
+            assert.equal(yield* fs.readFileString(sourcePath), "exact bytes");
+            if (changed) yield* fs.writeFileString(sourcePath, "new local work");
+            const cleanup = yield* coordinator.poll(
+              issued.sessionId,
+              workerMetadata(worker, "environment-linux"),
+            );
+            assert(cleanup);
+            const result = yield* Effect.scoped(execute(worker, cleanup, transport)).pipe(
+              Effect.result,
+            );
+            assert.equal(result._tag, changed ? "Failure" : "Success");
+            assert.equal(yield* fs.exists(sourcePath), changed);
+            if (changed) assert.equal(yield* fs.readFileString(sourcePath), "new local work");
+            assert.equal(yield* fs.readFileString(destinationPath), "exact bytes");
+            yield* coordinator.receipt(issued.sessionId, {
+              jobId: cleanup.job.id,
+              lease: cleanup.job.lease!,
+              result:
+                result._tag === "Success"
+                  ? result.success
+                  : {
+                      status: "failed",
+                      stdout: "",
+                      stderr: "source retained",
+                      exitCode: null,
+                      truncated: false,
+                    },
+            });
+          }
+        }),
+      ),
+  );
+
   it.effect(
     "reports escaped and invalid UTF-8 file output without stranding its durable receipt",
     () =>

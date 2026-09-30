@@ -324,7 +324,7 @@ const retry = Command.make("retry", {
 );
 export const fleetCommand = Command.make("fleet").pipe(
   Command.withDescription(
-    "Operate a private, thread-authorized fleet through existing T3 environments.",
+    "Grant normal T3 agents private access to other devices through existing environments.",
   ),
   Command.withSubcommands([
     enroll,

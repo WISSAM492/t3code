@@ -74,6 +74,9 @@ import * as TextGeneration from "./textGeneration/TextGeneration.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./provider/Layers/ProviderInstanceRegistryHydration.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
+import * as FleetCoordinator from "./fleet/Coordinator.ts";
+import * as FleetWorker from "./fleet/Worker.ts";
+import { routes as fleetRoutes } from "./fleet/http.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as DeviceService from "./device/DeviceService.ts";
@@ -513,6 +516,8 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(ProviderInstallationRefreshLive),
   Layer.provideMerge(ReplayMarkers.layer),
   Layer.provideMerge(ProviderAuthServiceLive),
+  Layer.provideMerge(FleetWorker.layer.pipe(Layer.provide(ProcessRunner.layer))),
+  Layer.provideMerge(FleetCoordinator.layer),
   // Core Services
   Layer.provideMerge(ServerSettingsLayerLive),
   Layer.provideMerge(CheckpointingLayerLive),
@@ -612,6 +617,7 @@ export const makeRoutesLayer = Layer.mergeAll(
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
     privateForwardRouteLayer,
+    fleetRoutes,
   ),
   McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer)),
   // Last, so no route layer can replace the server's one TracerDisabledWhen.

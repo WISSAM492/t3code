@@ -83,6 +83,7 @@ export const AuthOrchestrationOperateScope = "orchestration:operate" as const;
 export const AuthTerminalOperateScope = "terminal:operate" as const;
 // Opt-in: dedicated forwarding credentials receive this scope; ordinary client scopes stay unchanged.
 export const AuthPrivateForwardScope = "ports:forward" as const;
+export const AuthFleetDeviceScope = "fleet:device" as const;
 export const AuthReviewWriteScope = "review:write" as const;
 export const AuthAccessReadScope = "access:read" as const;
 export const AuthAccessWriteScope = "access:write" as const;
@@ -93,6 +94,7 @@ export const AuthEnvironmentScope = Schema.Literals([
   AuthOrchestrationOperateScope,
   AuthTerminalOperateScope,
   AuthPrivateForwardScope,
+  AuthFleetDeviceScope,
   AuthReviewWriteScope,
   AuthAccessReadScope,
   AuthAccessWriteScope,

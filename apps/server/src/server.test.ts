@@ -128,6 +128,7 @@ import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSna
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
+import * as FleetCoordinator from "./fleet/Coordinator.ts";
 import { OrchestrationEventStoreLive } from "./persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
@@ -1239,7 +1240,7 @@ const buildAppUnderTest = (options?: {
           ),
         };
       }),
-      Layer.provideMerge(makeAuthTestLayer()),
+      Layer.provideMerge(FleetCoordinator.layer.pipe(Layer.provideMerge(makeAuthTestLayer()))),
       Layer.provideMerge(ServerSecretStore.layer),
       Layer.provide(workspaceAndProjectServicesLayer),
       Layer.provideMerge(

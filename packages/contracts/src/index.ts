@@ -45,3 +45,4 @@ export * from "./resourceTelemetry.ts";
 export * from "./usage.ts";
 export * from "./rpc.ts";
 export * from "./worktreeSetup.ts";
+export * from "./fleet.ts";

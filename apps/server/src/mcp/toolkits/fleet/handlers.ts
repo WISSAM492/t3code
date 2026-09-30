@@ -1,3 +1,6 @@
+import { ConnectPeers } from "../../../cloud/ConnectPeers.ts";
+import { requestDeviceApproval } from "../../../fleet/Approvals.ts";
+import * as Option from "effect/Option";
 import * as NodeCrypto from "node:crypto";
 import { type FleetAction, type FleetJob } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -13,6 +16,25 @@ const operation = (job: FleetJob) => ({
 
 export const make = Effect.gen(function* () {
   const coordinator = yield* Coordinator;
+  const native = yield* Effect.serviceOption(ConnectPeers);
+  const connected = Effect.gen(function* () {
+    if (Option.isNone(native)) return [];
+    const invocation = yield* McpInvocationContext;
+    const peers = yield* native.value.list;
+    yield* coordinator.connectDevices(
+      peers.map((peer) => peer.environmentId),
+      invocation.threadId,
+    );
+    return peers;
+  });
+  const complete = (id: string) =>
+    Effect.gen(function* () {
+      const job = yield* coordinator.wait(id);
+      // Keep the normal tool call open while the user answers T3's approval card.
+      // A slow/offline action still returns its durable operation ID for later inspection.
+      const requested = yield* requestDeviceApproval(job);
+      return operation(requested ? yield* coordinator.wait(id, true) : job);
+    }).pipe(Effect.mapError(fleetError));
   const request = (
     device: string,
     action: FleetAction,
@@ -20,14 +42,18 @@ export const make = Effect.gen(function* () {
   ) =>
     Effect.gen(function* () {
       const invocation = yield* McpInvocationContext;
+      yield* connected;
       const job = yield* coordinator.enqueue(invocation.threadId, { requestId, device, action });
-      return operation(yield* coordinator.wait(job.id));
+      return yield* complete(job.id);
     }).pipe(Effect.mapError(fleetError));
   return FleetToolkit.of({
     fleet_devices: () =>
       Effect.gen(function* () {
         const invocation = yield* McpInvocationContext;
+        const peers = yield* connected;
         return (yield* coordinator.devices(invocation.threadId)).map((device) => ({
+          label: peers.find((peer) => peer.environmentId === device.id)?.label ?? device.id,
+          current: device.id === invocation.environmentId,
           id: device.id,
           online: device.online,
           permissions: device.permissions,
@@ -40,10 +66,11 @@ export const make = Effect.gen(function* () {
     fleet_result: ({ operationId }) =>
       Effect.gen(function* () {
         const invocation = yield* McpInvocationContext;
+        yield* connected;
         const job = yield* coordinator.job(operationId);
         if (job.threadId !== invocation.threadId)
           return yield* fail("This operation belongs to a different thread.");
-        return operation(yield* coordinator.wait(job.id));
+        return yield* complete(job.id);
       }),
     fleet_run: ({ requestId, device, command, afterOperationId }) =>
       request(
@@ -72,12 +99,13 @@ export const make = Effect.gen(function* () {
     fleet_transfer: (input) =>
       Effect.gen(function* () {
         const invocation = yield* McpInvocationContext;
+        yield* connected;
         const transfer = yield* coordinator.transfer(invocation.threadId, {
           ...input,
           requestId: input.requestId ?? NodeCrypto.randomUUID(),
         });
         const job = transfer.cleanup ?? transfer.destination;
-        return operation(yield* coordinator.wait(job.id));
+        return yield* complete(job.id);
       }),
   });
 });

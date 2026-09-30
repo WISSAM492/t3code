@@ -1,3 +1,4 @@
+import * as EnvironmentConnector from "../environments/EnvironmentConnector.ts";
 import * as HttpServer from "effect/unstable/http/HttpServer";
 import {
   RelayClientAuth,
@@ -1210,11 +1211,17 @@ describe("relay routing fallback", () => {
               Layer.mergeAll(
                 Layer.succeed(RelayConfiguration.RelayConfiguration, relaySettings),
                 Layer.mock(EnvironmentLinks.EnvironmentLinks, {}),
+                Layer.mock(EnvironmentConnector.EnvironmentConnector, {}),
                 Layer.mock(ManagedEndpointAllocations.ManagedEndpointAllocations, {}),
                 Layer.mock(ManagedEndpointProvider.ManagedEndpointProvider, {}),
               ),
             ),
-            Layer.provide([publisher, signatures]),
+            Layer.provide([
+              publisher,
+              signatures,
+              Layer.mock(EnvironmentLinks.EnvironmentLinks, {}),
+              Layer.mock(EnvironmentConnector.EnvironmentConnector, {}),
+            ]),
           ),
         ),
         Layer.provide(auth),
@@ -1288,5 +1295,121 @@ describe("relay routing fallback", () => {
       expect(response.status).toBe(404);
       expect(response.headers["access-control-allow-origin"]).toBe("*");
     }).pipe(Effect.scoped),
+  );
+});
+
+describe("Connect environment peers", () => {
+  it.effect(
+    "uses the installed environment identity and refuses another account or a replaced source key",
+    () =>
+      Effect.gen(function* () {
+        const requested: Array<
+          Parameters<EnvironmentConnector.EnvironmentConnector["Service"]["connect"]>[0]
+        > = [];
+        let active = true;
+        let sourceKey = "installed-source-key";
+        const endpoint = {
+          httpBaseUrl: "https://target.example.test",
+          wsBaseUrl: "wss://target.example.test/ws",
+          providerKind: "cloudflare_tunnel" as const,
+        };
+        const target = {
+          environmentId: EnvironmentId.make("target"),
+          label: "Windows",
+          endpoint,
+          linkedAt: "2026-09-30T00:00:00.000Z",
+        };
+        const auth = Layer.succeed(RelayEnvironmentAuth, {
+          environmentBearer: (effect) =>
+            effect.pipe(
+              Effect.provideService(RelayEnvironmentPrincipal, {
+                environmentId: "source",
+                environmentPublicKey: "installed-source-key",
+              }),
+            ),
+        });
+        const requestServices = Layer.mergeAll(
+          Layer.succeed(RelayConfiguration.RelayConfiguration, relaySettings),
+          Layer.mock(EnvironmentLinks.EnvironmentLinks, {
+            getForUser: ({ userId, environmentId }) =>
+              Effect.succeed(
+                active && userId === "owner" && environmentId === "source"
+                  ? {
+                      ...target,
+                      environmentId: EnvironmentId.make("source"),
+                      environmentPublicKey: sourceKey,
+                    }
+                  : null,
+              ),
+            listForUser: () => Effect.succeed([target]),
+          }),
+          Layer.mock(EnvironmentConnector.EnvironmentConnector, {
+            connect: (input) =>
+              Effect.sync(() => {
+                requested.push(input);
+                return {
+                  environmentId: target.environmentId,
+                  endpoint,
+                  credential: "bound-bootstrap",
+                  expiresAt: "2026-09-30T00:02:00.000Z",
+                };
+              }),
+          }),
+          Layer.mock(ManagedEndpointAllocations.ManagedEndpointAllocations, {}),
+          Layer.mock(ManagedEndpointProvider.ManagedEndpointProvider, {}),
+        );
+        const api = HttpApiBuilder.layer(HttpApi.make("RelayApi").add(RelayApi.groups.server)).pipe(
+          Layer.provide(
+            serverApi.pipe(
+              HttpRouter.provideRequest(requestServices),
+              Layer.provide(requestServices),
+              Layer.provide([
+                Layer.mock(AgentActivityPublisher.AgentActivityPublisher, {}),
+                Layer.mock(EnvironmentPublishSignatures.EnvironmentPublishSignatures, {}),
+              ]),
+            ),
+          ),
+          Layer.provide(auth),
+          Layer.provide([NodeServices.layer, NodeHttpPlatform.layer, Etag.layerWeak]),
+        );
+        const http = yield* HttpRouter.toHttpEffect(api);
+        const request = (url: string, cloudUserId: string) =>
+          http.pipe(
+            Effect.provideService(
+              HttpServerRequest.HttpServerRequest,
+              HttpServerRequest.fromWeb(
+                new Request(`https://relay.test${url}`, {
+                  method: "POST",
+                  headers: {
+                    authorization: "Bearer existing-environment-credential",
+                    "content-type": "application/json",
+                  },
+                  body: JSON.stringify({
+                    cloudUserId,
+                    clientProofKeyThumbprint: "device-proof-key",
+                    sourceEnvironmentId: "forged-source",
+                  }),
+                }),
+              ),
+            ),
+          );
+        expect((yield* request("/v1/peers", "owner")).status).toBe(200);
+        expect((yield* request("/v1/peers/target/connect", "owner")).status).toBe(200);
+        expect(requested).toEqual([
+          {
+            userId: "owner",
+            environmentId: "target",
+            clientProofKeyThumbprint: "device-proof-key",
+            sourceEnvironmentId: "source",
+          },
+        ]);
+        expect((yield* request("/v1/peers", "other-owner")).status).toBe(401);
+        expect((yield* request("/v1/peers/target/connect", "other-owner")).status).toBe(401);
+        sourceKey = "replacement-key";
+        expect((yield* request("/v1/peers/target/connect", "owner")).status).toBe(401);
+        active = false;
+        expect((yield* request("/v1/peers", "owner")).status).toBe(401);
+        expect(requested.length).toBe(1);
+      }).pipe(Effect.scoped),
   );
 });

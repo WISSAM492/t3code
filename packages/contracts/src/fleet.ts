@@ -167,6 +167,7 @@ export const FleetJob = Schema.Struct({
     "uncertain",
   ]),
   approved: Schema.Boolean,
+  approvalRevision: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   createdAt: Schema.Number,
   expiresAt: Schema.Number,
   lease: Schema.NullOr(Schema.String),

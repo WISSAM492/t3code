@@ -1,3 +1,4 @@
+import { ConnectPeers, parseConnectPeerSubject } from "../cloud/ConnectPeers.ts";
 import {
   AuthFleetDeviceScope,
   FleetMetadata,
@@ -6,6 +7,7 @@ import {
   EnvironmentScopeRequiredError,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -22,7 +24,10 @@ import { blobPath, uploadChunk, discardUpload } from "./Artifacts.ts";
 
 const authenticated = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
-  if (request.headers.origin !== undefined || !request.headers.authorization?.startsWith("Bearer "))
+  if (
+    request.headers.origin !== undefined ||
+    !/^Bearer |^DPoP /.test(request.headers.authorization ?? "")
+  )
     return yield* failEnvironmentAuthInvalid("missing_credential");
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
   const session = yield* auth
@@ -34,6 +39,17 @@ const authenticated = Effect.gen(function* () {
     );
   if (!session.scopes.includes(AuthFleetDeviceScope))
     return yield* failEnvironmentScopeRequired(AuthFleetDeviceScope);
+  const peer = parseConnectPeerSubject(session.subject);
+  if (peer) {
+    const peers = yield* Effect.serviceOption(ConnectPeers);
+    if (
+      Option.isNone(peers) ||
+      session.method !== "dpop-access-token" ||
+      !(yield* peers.value.authorize(peer.userId, peer.environmentId))
+    )
+      return yield* failEnvironmentAuthInvalid("invalid_credential");
+    return `connect:${peer.environmentId}`;
+  }
   return session.sessionId;
 });
 const body = <A>(schema: Schema.Decoder<A, never>) =>
@@ -70,7 +86,10 @@ export const routes = Layer.mergeAll(
       Effect.gen(function* () {
         const session = yield* authenticated;
         const coordinator = yield* Coordinator;
-        return yield* coordinator.poll(session, yield* body(FleetMetadata));
+        const metadata = yield* body(FleetMetadata);
+        if (session.startsWith("connect:") && session !== `connect:${metadata.environmentId}`)
+          return yield* fail("Connect worker identity does not match its credential.");
+        return yield* coordinator.poll(session, metadata);
       }),
     ),
   ),

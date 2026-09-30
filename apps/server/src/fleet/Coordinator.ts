@@ -73,7 +73,7 @@ export const make = Effect.gen(function* () {
     Effect.gen(function* () {
       if (!(yield* authorized(threadId, device, action)))
         return yield* fail(
-          "This thread has no current grant for that device and action. Ask the owner to use t3 fleet grant.",
+          "Connect this device to your T3 Connect account to use it. Legacy workers need an explicit thread grant.",
         );
     });
   const deviceBySession = (sessionId: string) =>
@@ -114,7 +114,8 @@ export const make = Effect.gen(function* () {
         const time = yield* now;
         const device = yield* sql<{
           metadata: string | null;
-        }>`SELECT metadata FROM fleet_devices WHERE id=${request.device}`;
+          session_id: string;
+        }>`SELECT metadata, session_id FROM fleet_devices WHERE id=${request.device}`;
         if (!device[0]) return yield* fail("Unknown Fleet device.");
         const metadata = device[0].metadata ? yield* decodeMetadata(device[0].metadata) : null;
         if (metadata) {
@@ -122,9 +123,7 @@ export const make = Effect.gen(function* () {
           if (action.kind === "run" && !metadata.tasks[action.task])
             return yield* fail("Device has no approved task with that name.");
           if (action.kind === "exec" && (!metadata.execution || metadata.execution === "disabled"))
-            return yield* fail(
-              "Commands are disabled on this device. The owner must enable execution in its worker configuration.",
-            );
+            return yield* fail("This device policy disables commands.");
           if (action.kind === "deploy" && !metadata.applications[action.application])
             return yield* fail("Device has no deployment recipe for that application.");
           if (
@@ -155,7 +154,10 @@ export const make = Effect.gen(function* () {
         }
         if (request.action.kind === "exec")
           needsApproval =
-            metadata?.execution !== "allow" || request.action.command.requiresElevation === true;
+            (metadata
+              ? metadata.execution !== "allow"
+              : device[0].session_id !== `connect:${request.device}`) ||
+            request.action.command.requiresElevation === true;
         if (request.action.kind === "deploy") {
           needsApproval = metadata?.applications[request.action.application] !== "always";
           const build = yield* artifact(request.action.sha256);
@@ -313,6 +315,38 @@ export const make = Effect.gen(function* () {
     }),
   );
   return {
+    // Connect owns these bindings. Human labels never replace stable environment identities.
+    connectDevices: (environmentIds: ReadonlyArray<string>, threadId?: string) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const time = yield* now;
+            const expires = time + 7 * 24 * 60 * 60 * 1000;
+            const previous = yield* sql<{
+              id: string;
+            }>`SELECT id FROM fleet_devices WHERE session_id LIKE 'connect:%'`;
+            for (const device of previous) {
+              if (!environmentIds.includes(device.id))
+                yield* sql`UPDATE fleet_grants SET expires_at=0 WHERE device=${device.id}`;
+            }
+            for (const id of environmentIds) {
+              const binding = `connect:${id}`;
+              yield* sql`INSERT INTO fleet_devices (id, session_id) VALUES (${id}, ${binding}) ON CONFLICT(id) DO NOTHING`;
+              const rows = yield* sql<{
+                session_id: string;
+              }>`SELECT session_id FROM fleet_devices WHERE id=${id}`;
+              if (rows[0]?.session_id !== binding)
+                return yield* fail("Connect device identity collides with a legacy enrollment.");
+              yield* sql`UPDATE fleet_grants SET expires_at=${expires} WHERE device=${id}`;
+              if (threadId)
+                yield* sql`INSERT INTO fleet_grants (thread_id, device, capabilities, expires_at) VALUES (${threadId}, ${id}, ${JSON.stringify(["run", "read", "write", "transfer"])}, ${expires}) ON CONFLICT(thread_id, device) DO UPDATE SET capabilities=excluded.capabilities, expires_at=excluded.expires_at`;
+            }
+          }),
+        )
+        .pipe(
+          Effect.tap(() => changed),
+          Effect.mapError(fleetError),
+        ),
     authorized: (threadId: string, device: string, action: FleetAction) =>
       authorized(threadId, device, action).pipe(Effect.mapError(fleetError)),
     enroll: (id: string, sessionId: string) =>
@@ -491,7 +525,10 @@ export const make = Effect.gen(function* () {
             return updated;
           }),
         )
-        .pipe(Effect.mapError(fleetError)),
+        .pipe(
+          Effect.tap(() => changed),
+          Effect.mapError(fleetError),
+        ),
     cancel: (id: string) =>
       sql
         .withTransaction(
@@ -644,7 +681,12 @@ export const make = Effect.gen(function* () {
                 approval !== "always" &&
                 (!job.approved || job.approvedPolicyHash !== metadata.policyHash)
               ) {
-                yield* save({ ...job, status: "awaiting-approval", approved: false });
+                yield* save({
+                  ...job,
+                  status: "awaiting-approval",
+                  approved: false,
+                  approvalRevision: (job.approvalRevision ?? 0) + 1,
+                });
                 continue;
               }
               const claimed: FleetJob = {
@@ -767,13 +809,17 @@ export const make = Effect.gen(function* () {
         .pipe(Effect.mapError(fleetError)),
     artifact: (hash: string) => artifact(hash).pipe(Effect.mapError(fleetError)),
     job: (id: string) => refresh.pipe(Effect.andThen(jobById(id)), Effect.mapError(fleetError)),
-    wait: (id: string) =>
+    wait: (id: string, waitForApproval = false) =>
       Effect.gen(function* () {
         const subscription = yield* PubSub.subscribe(changes);
         while (true) {
           yield* refresh;
           const job = yield* jobById(id);
-          if (!["queued", "running"].includes(job.status)) return job;
+          if (
+            !["queued", "running"].includes(job.status) &&
+            !(waitForApproval && job.status === "awaiting-approval")
+          )
+            return job;
           const devices = yield* sql<{
             last_seen: number | null;
           }>`SELECT last_seen FROM fleet_devices WHERE id=${job.device}`;
@@ -812,13 +858,28 @@ export const make = Effect.gen(function* () {
       ),
       Effect.mapError(fleetError),
     ),
+    pendingReceiptsFor: (coordinatorId: string) =>
+      sql<{
+        job_id: string;
+        lease: string;
+        result: string;
+      }>`SELECT job_id, lease, result FROM fleet_execution WHERE result IS NOT NULL AND coordinator_id=${coordinatorId}`.pipe(
+        Effect.flatMap((rows) =>
+          Effect.forEach(rows, (row) =>
+            decodeResult(row.result).pipe(
+              Effect.map((result) => ({ jobId: row.job_id, lease: row.lease, result })),
+            ),
+          ),
+        ),
+        Effect.mapError(fleetError),
+      ),
     forgetReceipt: (id: string) =>
       sql`DELETE FROM fleet_execution WHERE job_id=${id}`.pipe(
         Effect.asVoid,
         Effect.mapError(fleetError),
       ),
-    begin: (job: FleetJob) =>
-      sql`INSERT INTO fleet_execution (job_id, lease) VALUES (${job.id}, ${job.lease})`.pipe(
+    begin: (job: FleetJob, coordinatorId = "") =>
+      sql`INSERT INTO fleet_execution (job_id, lease, coordinator_id) VALUES (${job.id}, ${job.lease}, ${coordinatorId})`.pipe(
         Effect.asVoid,
         Effect.mapError(fleetError),
       ),

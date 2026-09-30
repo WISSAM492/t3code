@@ -52,7 +52,7 @@ function signTestJwt(payload: object, typ: string, privateKey: string): string {
   const header = Buffer.from(JSON.stringify({ alg: "EdDSA", typ })).toString("base64url");
   const encodedPayload = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const signingInput = `${header}.${encodedPayload}`;
-  return `${signingInput}.${NodeCrypto.sign(null, Buffer.from(signingInput), privateKey).toString("base64url")}`;
+  return `${signingInput}.${Buffer.from(NodeCrypto.sign(null, Buffer.from(signingInput), privateKey)).toString("base64url")}`;
 }
 
 const makeRequest = Effect.gen(function* () {

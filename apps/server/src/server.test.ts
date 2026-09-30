@@ -129,6 +129,7 @@ import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionRe
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
 import * as FleetCoordinator from "./fleet/Coordinator.ts";
+import * as ConnectPeers from "./cloud/ConnectPeers.ts";
 import { OrchestrationEventStoreLive } from "./persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
@@ -1240,7 +1241,12 @@ const buildAppUnderTest = (options?: {
           ),
         };
       }),
-      Layer.provideMerge(FleetCoordinator.layer.pipe(Layer.provideMerge(makeAuthTestLayer()))),
+      Layer.provideMerge(
+        Layer.mergeAll(
+          ConnectPeers.layer,
+          FleetCoordinator.layer.pipe(Layer.provideMerge(makeAuthTestLayer())),
+        ),
+      ),
       Layer.provideMerge(ServerSecretStore.layer),
       Layer.provide(workspaceAndProjectServicesLayer),
       Layer.provideMerge(
@@ -1475,6 +1481,7 @@ const makeCloudMintCredentialRequest = (input: {
   readonly privateKey: string;
   readonly environmentId: EnvironmentId;
   readonly clientProofKeyThumbprint: string;
+  readonly sourceEnvironmentId?: EnvironmentId;
   readonly issuer?: string;
   readonly audience?: string;
   readonly subject?: string;
@@ -1490,6 +1497,7 @@ const makeCloudMintCredentialRequest = (input: {
     sub: input.subject ?? "user_123",
     jti: input.jti ?? "cloud-mint-jti-1",
     environmentId: input.environmentId,
+    ...(input.sourceEnvironmentId ? { sourceEnvironmentId: input.sourceEnvironmentId } : {}),
     clientProofKeyThumbprint: input.clientProofKeyThumbprint,
     cnf: {
       jkt: input.clientProofKeyThumbprint,
@@ -13171,3 +13179,61 @@ it.live(
     }).pipe(Effect.provide(NodeServices.layer)),
   120_000,
 );
+
+it.layer(NodeServices.layer)("Connect peer minting", (it) => {
+  it.effect(
+    "mints Connect peer access from the relay-signed device identity without changing normal client access",
+    () =>
+      Effect.gen(function* () {
+        yield* buildAppUnderTest();
+        const keys = NodeCrypto.generateKeyPairSync("ed25519", {
+          privateKeyEncoding: { format: "pem", type: "pkcs8" },
+          publicKeyEncoding: { format: "pem", type: "spki" },
+        });
+        const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+        const config = yield* fetchEffect(yield* getHttpServerUrl("/api/connect/relay-config"), {
+          method: "POST",
+          headers: { cookie: ownerCookie, "content-type": "application/json" },
+          body: jsonRequestBody({
+            relayUrl: "https://relay.example.test",
+            cloudUserId: "user_123",
+            environmentCredential: "existing-environment-credential",
+            cloudMintPublicKey: keys.publicKey,
+            endpointRuntime: null,
+          }),
+        });
+        assert.equal(config.status, 200);
+        const now = yield* DateTime.now;
+        const mintUrl = yield* getHttpServerUrl("/api/t3-connect/mint-credential");
+        for (const source of [EnvironmentId.make("windows-peer"), undefined]) {
+          const request = makeCloudMintCredentialRequest({
+            privateKey: keys.privateKey,
+            environmentId: testEnvironmentDescriptor.environmentId,
+            clientProofKeyThumbprint: "source-dpop-thumbprint",
+            ...(source ? { sourceEnvironmentId: source } : {}),
+            jti: `native-peer-${source ?? "client"}`,
+            nonce: `native-peer-nonce-${source ?? "client"}`,
+            issuedAt: DateTime.formatIso(now),
+            expiresAt: DateTime.formatIso(DateTime.add(now, { minutes: 2 })),
+          });
+          const response = yield* fetchEffect(mintUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: jsonRequestBody(request),
+          });
+          assert.equal(response.status, 200);
+        }
+        const links = yield* fetchEffect(yield* getHttpServerUrl("/api/auth/pairing-links"), {
+          headers: { cookie: ownerCookie },
+        });
+        const body =
+          yield* responseJsonEffect<Array<{ subject: string; scopes: Array<string> }>>(links);
+        const peer = body.find(
+          (item) => item.subject === ConnectPeers.connectPeerSubject("user_123", "windows-peer"),
+        );
+        assert.deepEqual(peer?.scopes, ["fleet:device"]);
+        const ordinary = body.find((item) => item.subject === "cloud-connect");
+        assert.deepEqual(ordinary?.scopes, [...AuthStandardClientScopes]);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+});

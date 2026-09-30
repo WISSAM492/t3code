@@ -1,3 +1,17 @@
+import * as Context from "effect/Context";
+import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+import * as NodeHttpPlatform from "@effect/platform-node/NodeHttpPlatform";
+import * as Etag from "effect/unstable/http/Etag";
+import { EnvironmentHttpApi } from "@t3tools/contracts";
+import * as HttpApi from "effect/unstable/httpapi/HttpApi";
+import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
+import { authHttpApiLayer, environmentAuthenticatedAuthLayer } from "../auth/http.ts";
+import * as ConnectPeers from "../cloud/ConnectPeers.ts";
+import {
+  CLOUD_LINKED_USER_ID,
+  RELAY_URL_SECRET,
+  RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
+} from "../cloud/config.ts";
 import * as NodeHttp from "node:http";
 import * as NodeCrypto from "node:crypto";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
@@ -35,6 +49,7 @@ import {
   resolveRootPath,
   runClaim,
   runCycle,
+  runConnectCycle,
   workerMetadata as metadataFor,
 } from "./Worker.ts";
 
@@ -43,8 +58,20 @@ const authLayer = EnvironmentAuth.layer.pipe(
   Layer.provideMerge(ServerSecretStore.layer),
   Layer.provide(ServerEnvironment.identityLayer),
 );
-const fixture = HttpRouter.serve(routes, { disableListenLog: true, disableLogger: true }).pipe(
+const authRoutes = HttpApiBuilder.layer(
+  HttpApi.make("environment").add(EnvironmentHttpApi.groups.auth),
+).pipe(
+  Layer.provide(authHttpApiLayer),
+  Layer.provide(environmentAuthenticatedAuthLayer),
+  Layer.provide(Etag.layerWeak),
+  Layer.provide(NodeHttpPlatform.layer),
+);
+const fixture = HttpRouter.serve(Layer.mergeAll(routes, authRoutes), {
+  disableListenLog: true,
+  disableLogger: true,
+}).pipe(
   Layer.provideMerge(coordinatorLayer),
+  Layer.provideMerge(ConnectPeers.layer),
   Layer.provideMerge(authLayer),
   Layer.provideMerge(processLayer),
   Layer.provideMerge(NodeHttpServer.layer(NodeHttp.createServer, { host: "127.0.0.1", port: 0 })),
@@ -801,5 +828,156 @@ describe("Fleet outbound worker and HTTP boundary", () => {
         );
       }),
     ),
+  );
+});
+
+describe("native Connect device access", () => {
+  it.effect(
+    "discovers, executes and reads with only the existing Connect link, and removes access on unlink",
+    () =>
+      run(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const config = yield* ServerConfig.ServerConfig;
+          const auth = yield* EnvironmentAuth.EnvironmentAuth;
+          const coordinator = yield* Coordinator;
+          const secrets = yield* ServerSecretStore.ServerSecretStore;
+          const http = yield* HttpServer.HttpServer;
+          assert("port" in http.address);
+          const targetUrl = `http://127.0.0.1:${http.address.port}`;
+          const peer = {
+            environmentId: EnvironmentId.make("env-native"),
+            label: "Linux main",
+            endpoint: {
+              httpBaseUrl: targetUrl,
+              wsBaseUrl: targetUrl.replace("http:", "ws:") + "/ws",
+              providerKind: "cloudflare_tunnel" as const,
+            },
+            linkedAt: new Date().toISOString(),
+          };
+          const offline = {
+            ...peer,
+            environmentId: EnvironmentId.make("env-offline"),
+            label: "Windows PC",
+          };
+          let connections = 0;
+          const relayRoutes = HttpRouter.add(
+            "POST",
+            "/*",
+            Effect.gen(function* () {
+              const request = yield* HttpServerRequest.HttpServerRequest;
+              assert.equal(request.headers.authorization, "Bearer existing-connect-credential");
+              const input = (yield* request.json) as {
+                cloudUserId: string;
+                clientProofKeyThumbprint?: string;
+              };
+              assert.equal(input.cloudUserId, "connect-owner");
+              if (request.url === "/v1/peers")
+                return HttpServerResponse.jsonUnsafe({ environments: [peer, offline] });
+              if (request.url !== "/v1/peers/env-native/connect")
+                return HttpServerResponse.empty({ status: 503 });
+              connections++;
+              const issued = yield* auth.createPairingLink({
+                scopes: [AuthFleetDeviceScope],
+                subject: ConnectPeers.connectPeerSubject("connect-owner", "env-native"),
+                proofKeyThumbprint: input.clientProofKeyThumbprint!,
+              });
+              return HttpServerResponse.jsonUnsafe({
+                environmentId: peer.environmentId,
+                endpoint: peer.endpoint,
+                credential: issued.credential,
+                expiresAt: new Date(issued.expiresAt.epochMilliseconds).toISOString(),
+              });
+            }),
+          );
+          const relayContext = yield* Layer.build(
+            HttpRouter.serve(relayRoutes, { disableListenLog: true, disableLogger: true }).pipe(
+              Layer.provideMerge(
+                NodeHttpServer.layer(NodeHttp.createServer, { host: "127.0.0.1", port: 0 }),
+              ),
+              Layer.provide(NodeServices.layer),
+            ),
+          );
+          const relayHttp = Context.get(relayContext, HttpServer.HttpServer);
+          assert("port" in relayHttp.address);
+          const address = relayHttp.address;
+          const platform = yield* HostProcessPlatform;
+          const architecture = yield* HostProcessArchitecture;
+          yield* secrets.set(CLOUD_LINKED_USER_ID, new TextEncoder().encode("connect-owner"));
+          yield* secrets.set(
+            RELAY_URL_SECRET,
+            new TextEncoder().encode(`http://127.0.0.1:${address.port}`),
+          );
+          yield* secrets.set(
+            RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
+            new TextEncoder().encode("existing-connect-credential"),
+          );
+          const tools = yield* makeTools;
+          const nativeInvocation = { ...invocation, environmentId: peer.environmentId };
+          const devices = yield* tools
+            .fleet_devices()
+            .pipe(Effect.provideService(McpInvocationContext, nativeInvocation));
+          assert.deepEqual(
+            devices.map((device) => [device.label, device.current]),
+            [
+              ["Linux main", true],
+              ["Windows PC", false],
+            ],
+          );
+          const started = yield* tools
+            .fleet_run({
+              device: peer.environmentId,
+              command: {
+                executable: process.execPath,
+                args: ["-e", "process.stdout.write('native-ready')"],
+                cwd: config.stateDir,
+                timeoutSeconds: 30,
+              },
+            })
+            .pipe(Effect.provideService(McpInvocationContext, nativeInvocation));
+          assert.equal(started.status, "queued");
+          yield* runConnectCycle(peer.environmentId, platform, architecture);
+          const finished = yield* tools
+            .fleet_result({ operationId: started.operationId })
+            .pipe(Effect.provideService(McpInvocationContext, nativeInvocation));
+          assert.equal(finished.status, "succeeded");
+          assert.equal(finished.result?.stdout, "native-ready");
+          assert.equal(connections, 1);
+          assert.equal(yield* fs.exists(`${config.stateDir}/fleet-worker.json`), false);
+          const file = `${config.stateDir}/from-device.txt`;
+          yield* fs.writeFileString(file, "normal account filesystem access");
+          const read = yield* coordinator.enqueue(invocation.threadId, {
+            requestId: "native-read",
+            device: peer.environmentId,
+            action: { kind: "read", path: file },
+          });
+          yield* runConnectCycle(peer.environmentId, platform, architecture);
+          assert.equal(
+            (yield* coordinator.job(read.id)).result?.stdout,
+            "normal account filesystem access",
+          );
+          const pending = yield* tools
+            .fleet_run({
+              device: offline.environmentId,
+              command: {
+                executable: "powershell.exe",
+                args: ["-Command", "Write-Output test"],
+                cwd: "C:\\Users\\me",
+                timeoutSeconds: 30,
+              },
+            })
+            .pipe(Effect.provideService(McpInvocationContext, nativeInvocation));
+          assert.equal(pending.status, "queued");
+          yield* secrets.remove(CLOUD_LINKED_USER_ID);
+          yield* runConnectCycle(peer.environmentId, platform, architecture);
+          assert.deepEqual(
+            yield* tools
+              .fleet_devices()
+              .pipe(Effect.provideService(McpInvocationContext, nativeInvocation)),
+            [],
+          );
+          assert.equal((yield* coordinator.job(pending.operationId)).status, "cancelled");
+        }),
+      ),
   );
 });

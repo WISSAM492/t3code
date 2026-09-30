@@ -49,10 +49,12 @@ function makeDpopProof(input: {
       ...(input.accessToken ? { ath: computeDpopAccessTokenHash(input.accessToken) } : {}),
     }),
   ).toString("base64url");
-  const signature = NodeCrypto.sign("sha256", Buffer.from(`${header}.${payload}`), {
-    key: privateKey,
-    dsaEncoding: "ieee-p1363",
-  }).toString("base64url");
+  const signature = Buffer.from(
+    NodeCrypto.sign("sha256", Buffer.from(`${header}.${payload}`), {
+      key: privateKey,
+      dsaEncoding: "ieee-p1363",
+    }),
+  ).toString("base64url");
   return {
     proof: `${header}.${payload}.${signature}`,
     thumbprint: computeDpopJwkThumbprint(publicJwk),

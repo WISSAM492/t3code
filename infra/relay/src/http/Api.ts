@@ -1081,7 +1081,67 @@ export const serverApi = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const publisher = yield* AgentActivityPublisher.AgentActivityPublisher;
     const publishSignatures = yield* EnvironmentPublishSignatures.EnvironmentPublishSignatures;
-    const activityHandlers = handlers.handle(
+    const links = yield* EnvironmentLinks.EnvironmentLinks;
+    const connector = yield* EnvironmentConnector.EnvironmentConnector;
+    const requirePeerAccount = Effect.fnUntraced(function* (cloudUserId: string) {
+      const principal = yield* RelayEnvironmentPrincipal;
+      const source = yield* links.getForUser({
+        userId: cloudUserId,
+        environmentId: principal.environmentId,
+      });
+      if (!source || source.environmentPublicKey !== principal.environmentPublicKey)
+        return yield* new HttpApiError.Unauthorized({});
+      return principal;
+    });
+    const peerHandlers = handlers
+      .handle(
+        "listPeers",
+        Effect.fnUntraced(function* ({ payload }) {
+          yield* requirePeerAccount(payload.cloudUserId);
+          return { environments: yield* links.listForUser({ userId: payload.cloudUserId }) };
+        }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle(
+        "connectPeer",
+        Effect.fnUntraced(
+          function* ({ params, payload }) {
+            const source = yield* requirePeerAccount(payload.cloudUserId);
+            return yield* connector.connect({
+              userId: payload.cloudUserId,
+              environmentId: params.environmentId,
+              clientProofKeyThumbprint: payload.clientProofKeyThumbprint,
+              sourceEnvironmentId: source.environmentId,
+            });
+          },
+          mapRelayCommonApiErrors("not_authorized"),
+          mapErrorTags({
+            EnvironmentConnectNotAuthorized: (error, traceId) =>
+              new RelayEnvironmentConnectNotAuthorizedError({
+                code: "environment_connect_not_authorized",
+                reason: error.reason,
+                traceId,
+              }),
+            EnvironmentMintRequestFailed: (_error, traceId) =>
+              new RelayEnvironmentEndpointUnavailableError({
+                code: "environment_endpoint_unavailable",
+                reason: "endpoint_request_failed",
+                traceId,
+              }),
+            EnvironmentMintRequestTimedOut: (_error, traceId) =>
+              new RelayEnvironmentEndpointTimedOutError({
+                code: "environment_endpoint_timed_out",
+                traceId,
+              }),
+            EnvironmentMintResponseInvalid: (_error, traceId) =>
+              new RelayEnvironmentEndpointUnavailableError({
+                code: "environment_endpoint_unavailable",
+                reason: "endpoint_response_invalid",
+                traceId,
+              }),
+          }),
+        ),
+      );
+    const activityHandlers = peerHandlers.handle(
       "publishAgentActivity",
       Effect.fn("relay.api.server.publishAgentActivity")(
         function* (args) {

@@ -818,7 +818,9 @@ export const make = Effect.gen(function* () {
                 ...(input?.proofKeyThumbprint
                   ? {
                       proofKeyThumbprint: input.proofKeyThumbprint,
-                      ttl: Duration.hours(1),
+                      ttl: grant.subject.startsWith("connect-peer:")
+                        ? Duration.minutes(2)
+                        : Duration.hours(1),
                     }
                   : {}),
                 // Desktop restarts forget the previous bearer token. Replace

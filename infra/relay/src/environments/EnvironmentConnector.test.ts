@@ -84,7 +84,7 @@ function signTestJwt(payload: object, typ: string, privateKey: string): string {
   const header = Buffer.from(JSON.stringify({ alg: "EdDSA", typ })).toString("base64url");
   const encodedPayload = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const input = `${header}.${encodedPayload}`;
-  return `${input}.${NodeCrypto.sign(null, Buffer.from(input), privateKey).toString("base64url")}`;
+  return `${input}.${Buffer.from(NodeCrypto.sign(null, Buffer.from(input), privateKey)).toString("base64url")}`;
 }
 
 function decodeRequestProof<T>(proof: string): T {
@@ -827,3 +827,32 @@ describe("EnvironmentConnector", () => {
     }).pipe(Effect.provide(Layer.merge(TestClock.layer(), connectorTestLayer(execute))));
   });
 });
+
+it.effect(
+  "binds a peer mint proof to the authenticated source environment and the requesting account",
+  () => {
+    const proofs: Array<RelayCloudMintCredentialProofPayload> = [];
+    const execute = (request: HttpClientRequest.HttpClientRequest) =>
+      Effect.sync(() => {
+        const body = decodeMintRequestBody(requestBodyText(request));
+        proofs.push(decodeRequestProof<RelayCloudMintCredentialProofPayload>(body.proof));
+        return HttpClientResponse.fromWeb(request, Response.json(signMintResponse(body)));
+      });
+    return Effect.gen(function* () {
+      const connector = yield* EnvironmentConnector.EnvironmentConnector;
+      yield* connector.connect({
+        userId: "user_123",
+        environmentId: "env-connector-test",
+        clientProofKeyThumbprint: "device-proof-key",
+        sourceEnvironmentId: "linux-source",
+      });
+      expect(proofs[0]).toMatchObject({
+        sub: "user_123",
+        environmentId: "env-connector-test",
+        sourceEnvironmentId: "linux-source",
+        cnf: { jkt: "device-proof-key" },
+        scope: ["environment:connect"],
+      });
+    }).pipe(Effect.provide(connectorTestLayer(execute)));
+  },
+);

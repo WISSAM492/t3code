@@ -842,6 +842,8 @@ export const RelayCloudMintCredentialProofPayload = Schema.Struct({
     jkt: TrimmedNonEmptyString,
   }),
   deviceId: Schema.optional(TrimmedNonEmptyString),
+  // Only the environment-authenticated Connect endpoint may set this identity.
+  sourceEnvironmentId: Schema.optional(EnvironmentId),
   nonce: TrimmedNonEmptyString,
   scope: Schema.Array(Schema.Literal("environment:connect")),
 });
@@ -1138,6 +1140,20 @@ const RelayDpopClientGroup = HttpApiGroup.make("dpopClient")
 
 const RelayServerGroup = HttpApiGroup.make("server")
   .add(
+    HttpApiEndpoint.post("listPeers", "/v1/peers", {
+      payload: Schema.Struct({ cloudUserId: TrimmedNonEmptyString }),
+      success: RelayListEnvironmentsResponse,
+      error: RelayEnvironmentConnectErrors,
+    }),
+    HttpApiEndpoint.post("connectPeer", "/v1/peers/:environmentId/connect", {
+      params: Schema.Struct({ environmentId: EnvironmentId }),
+      payload: Schema.Struct({
+        cloudUserId: TrimmedNonEmptyString,
+        clientProofKeyThumbprint: TrimmedNonEmptyString,
+      }),
+      success: RelayEnvironmentConnectResponse,
+      error: RelayEnvironmentConnectErrors,
+    }),
     HttpApiEndpoint.post(
       "registerManagedEndpointRecovery",
       "/v1/environments/:environmentId/tunnel/recovery",
@@ -1172,7 +1188,10 @@ const RelayServerGroup = HttpApiGroup.make("server")
       },
     ).annotate(OpenApi.Summary, "Publish agent activity"),
   )
-  .annotate(OpenApi.Description, "Environment-authenticated activity publication.")
+  .annotate(
+    OpenApi.Description,
+    "Environment-authenticated Connect operations and activity publication.",
+  )
   .middleware(RelayEnvironmentAuth);
 
 export const RelayApi = HttpApi.make("RelayApi")

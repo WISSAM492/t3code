@@ -1,3 +1,4 @@
+import { parseConnectOrigin } from "../cloud/origin.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 // The listener is deliberately a Node adapter: it binds loopback and bridges native TCP streams.
 import * as NodeNet from "node:net";
@@ -24,26 +25,12 @@ export function parseMapping(value: string): PrivateForwardMapping {
 }
 
 export function resolveForwardUrl(value: string): URL {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new PrivateForwardError({ message: "Use an HTTPS T3 Connect origin for --remote." });
-  }
-  const isLoopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
-  if (
-    (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback)) ||
-    url.username ||
-    url.password ||
-    url.pathname !== "/" ||
-    url.search ||
-    url.hash
-  ) {
+  const url = parseConnectOrigin(value);
+  if (!url)
     throw new PrivateForwardError({
       message:
         "Use an HTTPS origin, or HTTP on loopback, without credentials, a path, or query parameters.",
     });
-  }
   return url;
 }
 

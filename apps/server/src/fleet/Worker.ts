@@ -1,5 +1,11 @@
+import { ConnectPeers } from "../cloud/ConnectPeers.ts";
 import * as NodeCrypto from "node:crypto";
-import { HostProcessPlatform, HostProcessArchitecture } from "@t3tools/shared/hostProcess";
+import {
+  HostProcessPlatform,
+  HostProcessArchitecture,
+  HostProcessEnvironment,
+  HostProcessWorkingDirectory,
+} from "@t3tools/shared/hostProcess";
 import {
   FleetArtifact,
   FleetClaim,
@@ -19,7 +25,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import packageJson from "../../package.json" with { type: "json" };
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
-import { resolveForwardUrl } from "../forward/client.ts";
+import { parseConnectOrigin } from "../cloud/origin.ts";
 import { ProcessRunner } from "../processRunner.ts";
 import { blobPath, readWorkerConfig, storeBlob, UPLOAD_CHUNK_BYTES } from "./Artifacts.ts";
 import {
@@ -44,12 +50,14 @@ const canonical = (value: unknown): unknown =>
             .map(([key, item]) => [key, canonical(item)]),
         )
       : value;
-export const workerPolicyHash = (config: FleetWorkerConfig) =>
+export type WorkerPolicy = FleetWorkerConfig & { readonly connectPeer?: true };
+
+export const workerPolicyHash = (config: WorkerPolicy) =>
   NodeCrypto.createHash("sha256")
     .update(JSON.stringify(canonical(config)))
     .digest("hex");
 export const workerMetadata = (
-  config: FleetWorkerConfig,
+  config: WorkerPolicy,
   environmentId: string,
   platform: NodeJS.Platform,
   architecture: NodeJS.Architecture,
@@ -87,7 +95,9 @@ export const workerMetadata = (
 });
 
 export const makeTransport = (config: FleetWorkerConfig, token: string) => {
-  const origin = resolveForwardUrl(config.coordinator);
+  const origin = parseConnectOrigin(config.coordinator);
+  if (!origin)
+    throw new FleetError({ message: "Use an HTTPS Connect origin, or HTTP on loopback." });
   if (!token || /\s/.test(token))
     throw new FleetError({ message: "Invalid Fleet credential file." });
   const request = (endpoint: string, init: RequestInit = {}) =>
@@ -178,7 +188,33 @@ const download = (claim: FleetClaim, transport: Transport) =>
     return yield* blobPath(expected.sha256);
   });
 
-export const execute = (config: FleetWorkerConfig, claim: FleetClaim, transport: Transport) =>
+const resolveWorkerPath = (
+  config: WorkerPolicy,
+  roots: Readonly<Record<string, string>>,
+  root: string | undefined,
+  input: string,
+  writing = false,
+  directory = false,
+) =>
+  Effect.gen(function* () {
+    // Native Connect actions have the same normal-account access as a T3 terminal. Legacy policies keep their root restrictions.
+    if (!config.connectPeer) return yield* resolveRootPath(roots, root, input, writing, directory);
+    const path = yield* Path.Path;
+    if (root || !path.isAbsolute(input))
+      return yield* fail("Use an absolute path on the connected device.");
+    if (input.includes("\0")) return yield* fail("Invalid device path.");
+    const fs = yield* FileSystem.FileSystem;
+    const candidate = path.resolve(input);
+    if (writing)
+      return path.join(yield* fs.realPath(path.dirname(candidate)), path.basename(candidate));
+    const real = yield* fs.realPath(candidate);
+    const info = yield* fs.stat(real);
+    if (directory ? info.type !== "Directory" : info.type !== "File")
+      return yield* fail(directory ? "Path must be a directory." : "Path must be a regular file.");
+    return real;
+  });
+
+export const execute = (config: WorkerPolicy, claim: FleetClaim, transport: Transport) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -194,17 +230,30 @@ export const execute = (config: FleetWorkerConfig, claim: FleetClaim, transport:
       return yield* command(action.command, claim);
     }
     if (action.kind === "search") {
-      const base = yield* resolveRootPath(config.readRoots, action.root, action.path, false, true);
+      const base = yield* resolveWorkerPath(
+        config,
+        config.readRoots,
+        action.root,
+        action.path,
+        false,
+        true,
+      );
       return success(yield* searchFiles(base, action));
     }
     if (action.kind === "stat") {
-      const file = yield* resolveRootPath(config.readRoots, action.root, action.path);
+      const file = yield* resolveWorkerPath(config, config.readRoots, action.root, action.path);
       return success({ file: yield* hashFile(file) });
     }
     if (action.kind === "write") {
       if (Buffer.byteLength(action.content) > MAX_OUTPUT_BYTES)
         return yield* fail("Write content exceeds 64 KiB; transfer larger files instead.");
-      const file = yield* resolveRootPath(config.writeRoots, action.root, action.path, true);
+      const file = yield* resolveWorkerPath(
+        config,
+        config.writeRoots,
+        action.root,
+        action.path,
+        true,
+      );
       return success({
         file: yield* writeFile(
           file,
@@ -217,7 +266,7 @@ export const execute = (config: FleetWorkerConfig, claim: FleetClaim, transport:
     if (action.kind === "remove-source") {
       const expected = claim.artifact;
       if (!expected) return yield* fail("Move has no verified source manifest.");
-      const file = yield* resolveRootPath(config.writeRoots, action.root, action.path);
+      const file = yield* resolveWorkerPath(config, config.writeRoots, action.root, action.path);
       const original = action.root
         ? path.resolve(config.writeRoots[action.root]!, action.path)
         : action.path;
@@ -240,7 +289,7 @@ export const execute = (config: FleetWorkerConfig, claim: FleetClaim, transport:
       return yield* command(task.command, claim);
     }
     if (action.kind === "read") {
-      const file = yield* resolveRootPath(config.readRoots, action.root, action.path);
+      const file = yield* resolveWorkerPath(config, config.readRoots, action.root, action.path);
       if ((yield* fs.stat(file)).size > BigInt(MAX_OUTPUT_BYTES))
         return yield* fail("File is too large for readFile; use transfer instead.");
       const bytes = yield* fs.readFile(file);
@@ -255,7 +304,7 @@ export const execute = (config: FleetWorkerConfig, claim: FleetClaim, transport:
       });
     }
     if (action.kind === "capture") {
-      const file = yield* resolveRootPath(config.readRoots, action.root, action.path);
+      const file = yield* resolveWorkerPath(config, config.readRoots, action.root, action.path);
       if ((yield* fs.stat(file)).size > BigInt(MAX_ARTIFACT_BYTES))
         return yield* fail("File exceeds the 1 GiB artifact limit.");
       const input = yield* fs.open(file, { flag: "r" });
@@ -291,7 +340,13 @@ export const execute = (config: FleetWorkerConfig, claim: FleetClaim, transport:
       }
     }
     if (action.kind === "receive") {
-      const destination = yield* resolveRootPath(config.writeRoots, action.root, action.path, true);
+      const destination = yield* resolveWorkerPath(
+        config,
+        config.writeRoots,
+        action.root,
+        action.path,
+        true,
+      );
       const source = yield* download(claim, transport);
       const temporary = yield* fs.makeTempFileScoped({
         directory: path.dirname(destination),
@@ -372,13 +427,22 @@ export const execute = (config: FleetWorkerConfig, claim: FleetClaim, transport:
     });
   }).pipe(Effect.mapError(fleetError));
 
-export const runClaim = (config: FleetWorkerConfig, claim: FleetClaim, transport: Transport) =>
+export const runClaim = (
+  config: WorkerPolicy,
+  claim: FleetClaim,
+  transport: Transport,
+  coordinatorId = "",
+) =>
   Effect.gen(function* () {
     const coordinator = yield* Coordinator;
-    yield* coordinator.begin(claim.job);
+    yield* coordinator.begin(claim.job, coordinatorId);
     const renew = Effect.gen(function* () {
       const current = yield* readWorkerConfig;
-      if (!current || workerPolicyHash(current) !== workerPolicyHash(config))
+      if (
+        config.connectPeer
+          ? current !== null
+          : !current || workerPolicyHash(current) !== workerPolicyHash(config)
+      )
         return yield* fail("Worker policy changed or worker was disabled.");
       yield* transport.json(
         "renew",
@@ -424,10 +488,10 @@ export const runClaim = (config: FleetWorkerConfig, claim: FleetClaim, transport
     return bounded;
   });
 
-const flushReceipts = (transport: Transport) =>
+const flushReceipts = (transport: Transport, coordinatorId = "") =>
   Effect.gen(function* () {
     const coordinator = yield* Coordinator;
-    for (const receipt of yield* coordinator.pendingReceipts) {
+    for (const receipt of yield* coordinator.pendingReceiptsFor(coordinatorId)) {
       yield* transport.json("receipt", receipt, Schema.Unknown);
       yield* coordinator.forgetReceipt(receipt.jobId);
     }
@@ -459,6 +523,53 @@ export const runCycle = (
     }
   });
 
+/** The existing server also executes for its connected peers, including its own workspace. */
+export const runConnectCycle = (
+  environmentId: string,
+  platform: NodeJS.Platform,
+  architecture: NodeJS.Architecture,
+) =>
+  Effect.gen(function* () {
+    const peers = yield* ConnectPeers;
+    const coordinator = yield* Coordinator;
+    const connected = yield* peers.list;
+    yield* coordinator.connectDevices(connected.map((peer) => peer.environmentId));
+    if (!connected.length) return;
+    const environment = yield* HostProcessEnvironment;
+    const cwd = yield* HostProcessWorkingDirectory;
+    const home = (platform === "win32" ? environment.USERPROFILE : environment.HOME) ?? cwd;
+    const configured = yield* readWorkerConfig;
+    const config: WorkerPolicy = configured ?? {
+      version: 1,
+      coordinator: "connect",
+      tokenFile: "",
+      connectPeer: true,
+      readRoots: { home, workspace: cwd },
+      writeRoots: { home, workspace: cwd },
+      execution: "allow",
+      tasks: {},
+      applications: {},
+    };
+    yield* Effect.forEach(
+      connected,
+      (peer) =>
+        Effect.gen(function* () {
+          const transport = peers.transport(peer.environmentId);
+          yield* flushReceipts(transport, peer.environmentId);
+          const claim = yield* transport.json(
+            "poll",
+            workerMetadata(config, environmentId, platform, architecture),
+            Schema.NullOr(FleetClaim),
+          );
+          if (claim) {
+            yield* runClaim(config, claim, transport, peer.environmentId);
+            yield* flushReceipts(transport, peer.environmentId);
+          }
+        }).pipe(Effect.catch((error) => Effect.logDebug(fleetError(error).message))),
+      { concurrency: 3, discard: true },
+    );
+  });
+
 /** One outbound worker inside the existing T3 server; no extra listening socket or daemon. */
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -468,22 +579,31 @@ export const layer = Layer.effectDiscard(
     const platform = yield* HostProcessPlatform;
     const architecture = yield* HostProcessArchitecture;
     yield* coordinator.recover;
-    let lastError = "";
-    const cycle = runCycle(environmentId, platform, architecture).pipe(
-      Effect.tap(() =>
-        Effect.sync(() => {
-          lastError = "";
-        }),
-      ),
-      Effect.catch((error) =>
-        Effect.gen(function* () {
-          const message = fleetError(error).message;
-          if (message !== lastError) {
-            lastError = message;
-            yield* Effect.logWarning(message);
-          }
-        }),
-      ),
+    const lastErrors = new Map<string, string>();
+    const checked = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            lastErrors.delete(name);
+          }),
+        ),
+        Effect.catch((error) =>
+          Effect.gen(function* () {
+            const message = fleetError(error).message;
+            if (message !== lastErrors.get(name)) {
+              lastErrors.set(name, message);
+              yield* Effect.logWarning(message);
+            }
+          }),
+        ),
+      );
+    // An older relay must not disable an already configured legacy worker.
+    const cycle = Effect.all(
+      [
+        checked("connect", runConnectCycle(environmentId, platform, architecture)),
+        checked("legacy", runCycle(environmentId, platform, architecture)),
+      ],
+      { concurrency: 2, discard: true },
     );
     yield* cycle.pipe(Effect.repeat({ schedule: Schedule.spaced("5 seconds") }), Effect.forkScoped);
   }),

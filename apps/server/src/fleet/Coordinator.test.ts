@@ -485,3 +485,36 @@ describe("Fleet durable coordinator", () => {
     }).pipe(Effect.provide(fixture)),
   );
 });
+
+describe("Connect device receipt recovery", () => {
+  it.effect("keeps pending receipts with their original environment across a worker restart", () =>
+    Effect.gen(function* () {
+      const coordinator = yield* Coordinator;
+      yield* coordinator.connectDevices(["env-native"], "thread-one");
+      const action = { kind: "read" as const, path: "/tmp/example.txt" };
+      const first = yield* coordinator.enqueue("thread-one", {
+        requestId: "first",
+        device: "env-native",
+        action,
+      });
+      const second = yield* coordinator.enqueue("thread-one", {
+        requestId: "second",
+        device: "env-native",
+        action,
+      });
+      yield* coordinator.begin({ ...first, lease: "lease-one" }, "linux-coordinator");
+      yield* coordinator.begin({ ...second, lease: "lease-two" }, "mac-coordinator");
+      yield* coordinator.finish(first.id, ok);
+      yield* coordinator.recover;
+      const linux = yield* coordinator.pendingReceiptsFor("linux-coordinator");
+      const mac = yield* coordinator.pendingReceiptsFor("mac-coordinator");
+      assert.equal(linux.length, 1);
+      assert.equal(linux[0]!.jobId, first.id);
+      assert.equal(linux[0]!.result.status, "succeeded");
+      assert.equal(mac.length, 1);
+      assert.equal(mac[0]!.jobId, second.id);
+      assert.equal(mac[0]!.result.status, "uncertain");
+      assert.deepEqual(yield* coordinator.pendingReceiptsFor(""), []);
+    }).pipe(Effect.provide(fixture)),
+  );
+});

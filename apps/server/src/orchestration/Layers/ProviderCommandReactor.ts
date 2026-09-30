@@ -1,3 +1,5 @@
+import { Coordinator as DeviceCoordinator } from "../../fleet/Coordinator.ts";
+import { isDeviceApproval, respondToDeviceApproval } from "../../fleet/Approvals.ts";
 import { withWorkspaceLease } from "../../workspace/workspaceLease.ts";
 import {
   type ChatAttachment,
@@ -211,6 +213,7 @@ function buildGeneratedWorktreeBranchName(raw: string): string {
 }
 
 const make = Effect.gen(function* () {
+  const devices = yield* Effect.serviceOption(DeviceCoordinator);
   const crypto = yield* Crypto.Crypto;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
@@ -1631,6 +1634,28 @@ const make = Effect.gen(function* () {
   ) {
     const thread = yield* resolveThreadShell(event.payload.threadId);
     if (!thread) {
+      return;
+    }
+    if (isDeviceApproval(event.payload.requestId) && Option.isSome(devices)) {
+      yield* respondToDeviceApproval(
+        event.payload.threadId,
+        event.payload.requestId,
+        event.payload.decision,
+      ).pipe(
+        Effect.provideService(DeviceCoordinator, devices.value),
+        Effect.provideService(OrchestrationEngineService, orchestrationEngine),
+        Effect.catch((error) =>
+          appendProviderFailureActivity({
+            threadId: event.payload.threadId,
+            kind: "provider.approval.respond.failed",
+            summary: "Device approval failed",
+            detail: error.message,
+            turnId: null,
+            createdAt: event.payload.createdAt,
+            requestId: event.payload.requestId,
+          }),
+        ),
+      );
       return;
     }
     const hasSession = thread.session && thread.session.status !== "stopped";

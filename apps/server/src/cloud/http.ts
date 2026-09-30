@@ -1,3 +1,5 @@
+import { AuthFleetDeviceScope } from "@t3tools/contracts";
+import { connectPeerSubject } from "./ConnectPeers.ts";
 import * as NodeCrypto from "node:crypto";
 import {
   AuthRelayReadScope,
@@ -1549,8 +1551,10 @@ const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCredential")
 
     const keyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(dependencies.secrets);
     const issued = yield* dependencies.environmentAuth.createPairingLink({
-      scopes: AuthStandardClientScopes,
-      subject: "cloud-connect",
+      scopes: proof.sourceEnvironmentId ? [AuthFleetDeviceScope] : AuthStandardClientScopes,
+      subject: proof.sourceEnvironmentId
+        ? connectPeerSubject(proof.sub, proof.sourceEnvironmentId)
+        : "cloud-connect",
       ttl: Duration.minutes(2),
       label: "T3 Connect connect",
       proofKeyThumbprint: proof.clientProofKeyThumbprint,

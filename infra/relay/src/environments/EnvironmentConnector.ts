@@ -1,4 +1,5 @@
 import {
+  EnvironmentId,
   EnvironmentHttpBadRequestError,
   EnvironmentHttpConflictError,
   EnvironmentHttpForbiddenError,
@@ -137,6 +138,7 @@ export class EnvironmentConnector extends Context.Service<
       readonly environmentId: string;
       readonly clientProofKeyThumbprint: string;
       readonly deviceId?: string;
+      readonly sourceEnvironmentId?: string;
     }) => Effect.Effect<RelayEnvironmentConnectResponse, EnvironmentConnectorError>;
     readonly status: (input: {
       readonly userId: string;
@@ -603,6 +605,9 @@ const make = Effect.gen(function* () {
         clientProofKeyThumbprint: input.clientProofKeyThumbprint,
         cnf: { jkt: input.clientProofKeyThumbprint },
         ...(input.deviceId ? { deviceId: input.deviceId } : {}),
+        ...(input.sourceEnvironmentId
+          ? { sourceEnvironmentId: EnvironmentId.make(input.sourceEnvironmentId) }
+          : {}),
         nonce,
         scope: ["environment:connect"],
       } satisfies RelayCloudMintCredentialProofPayload;

@@ -24,10 +24,12 @@ const completion =
 const Devices = Tool.make("fleet_devices", {
   description:
     use +
-    "Discover this thread's authorized devices, OS, architecture, online status, command policy, and absolute paths of approved folders. Use these paths to find a file when the user only knows its name. An empty list means device access has not been granted.",
+    "Discover devices already linked to the same T3 Connect account: stable IDs, human labels, OS, architecture, availability, command policy and starting paths. current identifies this thread's environment. Use labels and OS to choose the machine the user named; use its returned ID in device tools. No Fleet enrollment, joining or token setup is needed. An empty list means connect your environments through T3 Connect.",
   success: Schema.Array(
     Schema.Struct({
       id: FleetDevice.fields.id,
+      label: Schema.String,
+      current: Schema.Boolean,
       online: Schema.Boolean,
       os: Schema.NullOr(FleetMetadata.fields.os),
       arch: Schema.NullOr(FleetMetadata.fields.arch),
@@ -55,7 +57,7 @@ const Result = Tool.make("fleet_result", {
 const Run = Tool.make("fleet_run", {
   description:
     use +
-    "Execute a command on a granted Linux, macOS or Windows device as its normal T3 account. Supply an executable and argv; for shell syntax use that platform's shell explicitly (for example powershell.exe -NoProfile -NonInteractive -Command ... on Windows). cwd is an absolute target path. This supports tests, installers, app APIs, logs and normal development without predefined tasks. Prefer direct CLI/API calls over GUI interaction. For installations, transfer the exact build and verify the installed version afterwards. Supply afterOperationId to wait for a pending transfer or other prerequisite before running the command; a failed prerequisite cancels it. requiresElevation requests once approval; it does not grant OS administrator rights. Command permission permits normal account access beyond the file-tool roots. " +
+    "Execute a command on a connected Linux, macOS or Windows device as its normal T3 account. Supply an executable and argv; for shell syntax use that platform's shell explicitly (for example powershell.exe -NoProfile -NonInteractive -Command ... on Windows). cwd is an absolute target path. This supports tests, installers, app APIs, logs and normal development without predefined tasks. Prefer direct CLI/API calls over GUI interaction. For installations, transfer the exact build and verify the installed version afterwards. Supply afterOperationId to wait for a pending transfer or other prerequisite before running the command; a failed prerequisite cancels it. requiresElevation requests once approval; it does not grant OS administrator rights. Command permission permits normal account access beyond the file-tool roots. " +
     completion,
   parameters: Schema.Struct({
     requestId,
@@ -70,7 +72,7 @@ const Run = Tool.make("fleet_run", {
 const Search = Tool.make("fleet_search_files", {
   description:
     use +
-    "List a directory or find filenames on a device inside its approved read folders. path is an absolute target directory. query is a case-insensitive filename substring; search is recursive by default when query is given. Symlinks are skipped. Results are bounded to 200 matches, 20,000 entries and 32 directory levels; truncated means narrow the directory or query. " +
+    "List a directory or find filenames on a device as its normal T3 account. path is an absolute target directory. query is a case-insensitive filename substring; search is recursive by default when query is given. Symlinks are skipped. Results are bounded to 200 matches, 20,000 entries and 32 directory levels; truncated means narrow the directory or query. " +
     completion,
   parameters: Schema.Struct({
     requestId,
@@ -87,7 +89,7 @@ const Search = Tool.make("fleet_search_files", {
 const Read = Tool.make("fleet_read_file", {
   description:
     use +
-    "Read a text file (up to 64 KiB) at its absolute target path inside an approved read folder. Returns contents and SHA-256 for comparison or a guarded edit. Transfer larger or binary files to the current device and use the normal local tools. " +
+    "Read a text file (up to 64 KiB) at its absolute target path as its normal T3 account. Returns contents and SHA-256 for comparison or a guarded edit. Transfer larger or binary files to the current device and use the normal local tools. " +
     completion,
   parameters: Schema.Struct({ requestId, device, path }),
   success: FleetOperation,
@@ -97,7 +99,7 @@ const Read = Tool.make("fleet_read_file", {
 const Stat = Tool.make("fleet_stat_file", {
   description:
     use +
-    "Get a file's size and SHA-256 without transferring it (up to 1 GiB). path is absolute and inside an approved read folder. Compare hashes across devices to compare their exact contents. " +
+    "Get a file's size and SHA-256 without transferring it (up to 1 GiB). path is absolute and as its normal T3 account. Compare hashes across devices to compare their exact contents. " +
     completion,
   parameters: Schema.Struct({ requestId, device, path }),
   success: FleetOperation,
@@ -107,7 +109,7 @@ const Stat = Tool.make("fleet_stat_file", {
 const Write = Tool.make("fleet_write_file", {
   description:
     use +
-    "Atomically write UTF-8 text up to 64 KiB at an absolute path inside an approved write folder. Parent directory must exist. Defaults to creating a new file and refuses collisions. For an edit, pass the expectedSha256 returned by reading the file; it replaces only if the current contents match. overwrite=true explicitly allows replacement without a hash check. Larger or binary files use fleet_transfer. " +
+    "Atomically write UTF-8 text up to 64 KiB at an absolute path as its normal T3 account. Parent directory must exist. Defaults to creating a new file and refuses collisions. For an edit, pass the expectedSha256 returned by reading the file; it replaces only if the current contents match. overwrite=true explicitly allows replacement without a hash check. Larger or binary files use fleet_transfer. " +
     completion,
   parameters: Schema.Struct({
     requestId,
@@ -124,7 +126,7 @@ const Write = Tool.make("fleet_write_file", {
 const Transfer = Tool.make("fleet_transfer", {
   description:
     use +
-    "Copy or move a file between devices over their authenticated T3 connections. fromPath/toPath are absolute native paths in the source read folder and destination write folder. Use move=true only when the user requests a move: source removal requires its write folder permission and happens after hash-verified delivery, only if the source is unchanged. Defaults to copy; overwrite=true explicitly replaces the destination. Parent directories must exist; create them with fleet_run when authorized. Bytes are SHA-256 verified and limited to 1 GiB. Pass expectedSha256 to transfer the exact file/build inspected earlier. Enroll the current machine too for transfers to/from the local workspace. " +
+    "Copy or move a file between devices over their authenticated T3 connections. fromPath/toPath are absolute native paths on the source and destination machines. Use move=true only when the user requests a move: source removal requires the source account's write permission and happens after hash-verified delivery, only if the source is unchanged. Defaults to copy; overwrite=true explicitly replaces the destination. Parent directories must exist; create them with fleet_run when authorized. Bytes are SHA-256 verified and limited to 1 GiB. Pass expectedSha256 to transfer the exact file/build inspected earlier. The current connected environment is included automatically for transfers to/from the local workspace. " +
     completion,
   parameters: Schema.Struct({
     requestId,

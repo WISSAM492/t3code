@@ -30,6 +30,56 @@ connection. Pull request diffs and provider settings keep working after the
 previous credential expires. A failed renewal affects that request; it does not
 disconnect an otherwise healthy conversation.
 
+## Private localhost forwarding
+
+Use private forwarding to open a host's local web servers from another machine
+through its existing T3 Connect address. Run a build with forwarding support on
+both machines. The host services stay bound to `127.0.0.1`; the receiving machine
+runs a small CLI listener that also binds only `127.0.0.1`.
+
+On the host, approve the destination ports and create a forwarding credential:
+
+```bash
+t3 forward allow 5173 8080
+t3 forward token --out ~/t3-forward-token --ttl 30d
+```
+
+The approved list is empty by default. `allow` replaces the entire list; use it
+again with fewer ports to remove an approval. These commands run on the host,
+using the same T3 home as its server. Pass `--base-dir` if that server uses a
+custom home.
+
+Transfer the credential file privately to your receiving machine, then run:
+
+```bash
+t3 forward --remote https://YOUR-EXISTING-T3-CONNECT-HOST \
+  --token-file ~/t3-forward-token \
+  --map 5173:5173 --map 8080:8080
+```
+
+Use the host's managed environment address, not `app.t3.codes`. Open
+`http://127.0.0.1:5173` or `http://127.0.0.1:8080` in your browser. If a local port
+is occupied, use a different first port, for example `--map 15173:5173`.
+WebSocket connections, including Vite HMR and Guacamole's desktop tunnel,
+travel through the same forward.
+
+The credential grants only forwarding access. It expires after the requested
+TTL; the token command prints a session ID and its revocation command without
+printing the secret. Keep the file private on both machines.
+
+Press Ctrl+C on the receiving machine to stop its listeners. On the host,
+`t3 forward list` shows approvals and `t3 forward disable` removes all of them.
+Removing an approval, revoking the credential with `t3 auth session revoke`, or
+letting it expire closes active forwards within one second. A disconnected
+stream closes; the next local connection opens a new stream when the host is
+reachable again.
+
+Destinations are limited to approved host `127.0.0.1` ports. No separate tunnel,
+router forwarding, or public service URL is created. Guacamole can stay on host
+`127.0.0.1:8080` and connect internally to Windows over RDP on your home LAN.
+Guacamole still requires its own login. Leave Tailscale and native RDP available
+for networks where you already use them.
+
 ## Pair over a LAN or private network
 
 Use direct pairing when the other device can reach the host's network address.
